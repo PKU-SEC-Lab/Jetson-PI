@@ -14,6 +14,58 @@ Vision-Language-Action (VLA) models have achieved impressive performance on dive
   <a href="./video/demo.mp4">▶ Full video (mp4)</a>
 </p>
 
+## Results on LIBERO (π₀.₅)
+
+Success rate comparison across four LIBERO sub-datasets. We report SR of Foresight-Aligned Asynchronous Correction alone (**Ours**) and with Confidence-based Scheduling Optimization (**+Sched**). Inference time of the action expert is estimated as $\Delta_{ae}=\lceil\Delta/3\rceil$, a common ratio on both high-end GPUs (e.g. RTX 4090) and onboard GPUs (e.g. Orin). We train **one model** for all $\Delta$ values.
+
+<div align="center">
+
+<table>
+<thead>
+<tr>
+  <th></th>
+  <th colspan="4">SPATIAL</th>
+  <th colspan="4">OBJECT</th>
+  <th colspan="4">GOAL</th>
+  <th colspan="4">LIBERO-10</th>
+</tr>
+<tr>
+  <th>Sync.</th>
+  <th colspan="4">97.3</th>
+  <th colspan="4">99.6</th>
+  <th colspan="4">96.7</th>
+  <th colspan="4">93.5</th>
+</tr>
+<tr>
+  <th>Δ</th>
+  <th>VLASH</th><th>RTC</th><th>Ours</th><th>+Sched</th>
+  <th>VLASH</th><th>RTC</th><th>Ours</th><th>+Sched</th>
+  <th>VLASH</th><th>RTC</th><th>Ours</th><th>+Sched</th>
+  <th>VLASH</th><th>RTC</th><th>Ours</th><th>+Sched</th>
+</tr>
+</thead>
+<tbody>
+<tr><td>1</td><td>98.8</td><td>97.1</td><td>97.7</td><td>98.6</td><td>99.2</td><td>98.5</td><td>98.7</td><td>98.8</td><td>96.7</td><td>96.5</td><td>97.0</td><td>97.5</td><td>94.4</td><td>92.3</td><td>93.4</td><td>93.1</td></tr>
+<tr><td>2</td><td>97.5</td><td>95.4</td><td>97.1</td><td>97.6</td><td>99.2</td><td>98.5</td><td>98.5</td><td>99.3</td><td>97.0</td><td>96.0</td><td>96.2</td><td>97.3</td><td>94.6</td><td>92.1</td><td>92.7</td><td>92.9</td></tr>
+<tr><td>3</td><td>94.4</td><td>94.5</td><td>97.1</td><td>97.2</td><td>98.8</td><td>96.4</td><td>98.2</td><td>98.4</td><td>93.3</td><td>94.3</td><td>96.7</td><td>96.4</td><td>91.9</td><td>89.6</td><td>91.3</td><td>91.9</td></tr>
+<tr><td>4</td><td>92.5</td><td>92.5</td><td>96.7</td><td>96.9</td><td>96.9</td><td>97.7</td><td>97.8</td><td>98.9</td><td>93.3</td><td>93.3</td><td>95.9</td><td>96.9</td><td>89.6</td><td>85.8</td><td>91.8</td><td>92.3</td></tr>
+<tr><td>5</td><td>84.3</td><td>91.2</td><td>95.9</td><td>96.7</td><td>94.3</td><td>96.9</td><td>96.9</td><td>98.6</td><td>89.9</td><td>93.9</td><td>96.0</td><td>96.1</td><td>80.3</td><td>83.6</td><td>91.5</td><td>92.0</td></tr>
+<tr><td>6</td><td>74.4</td><td>91.7</td><td>97.0</td><td>97.5</td><td>88.5</td><td>97.4</td><td>98.3</td><td>98.4</td><td>81.3</td><td>94.0</td><td>96.7</td><td>96.9</td><td>78.5</td><td>84.6</td><td>92.2</td><td>92.9</td></tr>
+<tr><td>7</td><td>51.3</td><td>91.7</td><td>97.0</td><td>97.3</td><td>81.4</td><td>97.1</td><td>98.0</td><td>98.4</td><td>76.1</td><td>92.6</td><td>97.1</td><td>97.2</td><td>77.0</td><td>85.3</td><td>92.6</td><td>92.6</td></tr>
+<tr><td>8</td><td>46.7</td><td>90.9</td><td>97.2</td><td>97.5</td><td>65.1</td><td>93.8</td><td>98.3</td><td>98.8</td><td>70.8</td><td>93.4</td><td>96.8</td><td>96.8</td><td>65.5</td><td>83.2</td><td>92.3</td><td>92.7</td></tr>
+<tr><td>9</td><td>30.1</td><td>88.8</td><td>97.0</td><td>97.3</td><td>51.7</td><td>93.1</td><td>97.5</td><td>97.6</td><td>59.7</td><td>92.5</td><td>96.3</td><td>96.5</td><td>59.6</td><td>81.0</td><td>92.0</td><td>92.2</td></tr>
+<tr>
+  <td><b>Avg</b></td>
+  <td>74.4</td><td>92.6</td><td>97.0</td><td><b>97.4</b></td>
+  <td>86.1</td><td>96.6</td><td>98.0</td><td><b>98.6</b></td>
+  <td>84.2</td><td>94.1</td><td>96.5</td><td><b>96.8</b></td>
+  <td>81.3</td><td>86.4</td><td>92.2</td><td><b>92.5</b></td>
+</tr>
+</tbody>
+</table>
+
+</div>
+
 ---
 
 ## Requirements
