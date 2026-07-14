@@ -4,6 +4,12 @@
 
 Vision-Language-Action (VLA) models have achieved impressive performance on diverse embodied tasks, yet deploying them on low-power onboard devices such as NVIDIA Jetson Orin remains challenging due to high inference latency and limited compute. Asynchronous inference can partially mask this latency, but it introduces **prediction–execution misalignment** and **long reaction time**. Jetson-PI addresses both through **Foresight-Aligned Asynchronous Correction (FAAC)**: we train a lightweight **future correction module** that predicts **future environment representation** conditioned on committed actions, enabling the **action expert** to directly predict actions from the future time step; we further introduce **confidence-based scheduling optimization** that adaptively balances VLM and action expert invocations. This release currently open-sources **LIBERO training and evaluation code** built on **π₀.₅**; the **llama.cpp**-based onboard deployment framework will be released **after the paper is accepted**.
 
+## Real-world Demo
+
+<video src="./video/demo.mp4" controls width="720"></video>
+
+[Download demo video](./video/demo.mp4)
+
 ---
 
 ## Requirements
@@ -62,12 +68,27 @@ Eval-only dependencies are listed in `test_requirements.txt`.
 
 ### 4. Paths and checkpoints
 
+#### Download checkpoints (ModelScope)
+
+Pretrained **π₀.₅-LIBERO** + **future correction module** (LIBERO-spatial, step 65000) are hosted on ModelScope:
+
+**[zebinyang/Jetson-PI-pi05](https://www.modelscope.cn/models/zebinyang/Jetson-PI-pi05)**
+
+```bash
+pip install modelscope
+python -c "from modelscope import snapshot_download; snapshot_download('zebinyang/Jetson-PI-pi05', local_dir='./checkpoints/jetson-pi-pi05')"
+export PI0_CHECKPOINT=./checkpoints/jetson-pi-pi05/pi05_libero
+export WM=./checkpoints/jetson-pi-pi05/future_correction_module
+```
+
+The bundle contains two separate directories (`pi05_libero/`, `future_correction_module/`); do not merge their `params/` trees.
+
 Set these before training or evaluation:
 
 | Variable | Description |
 |----------|-------------|
-| `PI0_CHECKPOINT` | π₀.₅-LIBERO weights (local dir with `params/`). Download: `gs://openpi-assets/checkpoints/pi05_libero` |
-| `WM` | **Eval only.** Path to trained future correction module dir (must contain `params/`). Example: `PATH/TO/future-correction-module` |
+| `PI0_CHECKPOINT` | π₀.₅-LIBERO weights (local dir with `params/`). Use `pi05_libero/` from [ModelScope](https://www.modelscope.cn/models/zebinyang/Jetson-PI-pi05), or download upstream: `gs://openpi-assets/checkpoints/pi05_libero` |
+| `WM` | **Eval only.** Path to trained future correction module dir (must contain `params/`). Use `future_correction_module/` from [ModelScope](https://www.modelscope.cn/models/zebinyang/Jetson-PI-pi05) |
 | `OPENPI_LIBERO_LOCAL_DATASET_DIR` | LeRobot LIBERO dataset root (parquet + `meta/tasks.jsonl`) |
 | `PY` | Python for **training** (JAX venv) |
 | `PY_SERVER` | Python for **serve_policy** (must have JAX; often same as `PY`) |
