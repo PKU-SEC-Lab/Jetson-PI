@@ -6,9 +6,13 @@ Vision-Language-Action (VLA) models have achieved impressive performance on dive
 
 ## Real-world Demo
 
-![Real-world demo](./video/demo.gif)
+<p align="center">
+  <img src="./video/demo.gif" alt="Real-world demo" width="720"/>
+</p>
 
-[▶ Full video (mp4)](./video/demo.mp4)
+<p align="center">
+  <a href="./video/demo.mp4">▶ Full video (mp4)</a>
+</p>
 
 ---
 
