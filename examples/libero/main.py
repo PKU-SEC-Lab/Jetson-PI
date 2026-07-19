@@ -13,6 +13,7 @@ from libero.libero.envs import OffScreenRenderEnv
 import numpy as np
 from openpi_client import action_chunk_broker
 from openpi_client import image_tools
+from openpi_client import task_c_trace
 from openpi_client import websocket_client_policy as _websocket_client_policy
 import tqdm
 import tyro
@@ -390,7 +391,6 @@ def _make_wm_low_replan_two_phase_fn(
 ) -> Callable[[dict, dict], dict]:
 
     def low_replan_two_phase(_obs_snap: dict, p1: dict) -> dict:
-        del _obs_snap
         if not bool(p1.get("openpi/wm_low_replan_two_phase")):
             return p1
         env = env_holder.get("env")
@@ -411,7 +411,33 @@ def _make_wm_low_replan_two_phase_fn(
         obs = None
         for i in range(n_roll):
             arow = roll[i]
+            state_before = None
+            task_c_recorder = env_holder.get("task_c_recorder")
+            task_c_context = _obs_snap.get(task_c_trace.TRACE_KEY)
+            if task_c_recorder is not None and task_c_context is not None:
+                latest_obs = env_holder.get("task_c_latest_obs")
+                if latest_obs is None:
+                    raise task_c_trace.TaskCTraceError("missing latest LIBERO observation for low-replan trace")
+                state_before = _pack_libero_proprio_vector(latest_obs)
             obs, _reward, done, _info = env.step(np.asarray(arow, dtype=np.float32).reshape(-1).tolist())
+            env_holder["task_c_latest_obs"] = obs
+            if task_c_recorder is not None and task_c_context is not None:
+                base_context = task_c_trace.validate_trace_context(task_c_context)
+                hidden_context = {
+                    **base_context,
+                    "env_step": int(env_holder.get("task_c_sim_step", 0)),
+                }
+                task_c_recorder.record_step(
+                    hidden_context,
+                    source="low_replan_rollout",
+                    task_description=task_description,
+                    action=arow,
+                    state_before=state_before,
+                    state_after=_pack_libero_proprio_vector(obs),
+                    done_after_step=bool(done),
+                    policy_kappa=None,
+                )
+                env_holder["task_c_sim_step"] = int(env_holder.get("task_c_sim_step", 0)) + 1
             if done:
                 break
         if obs is None:
@@ -426,6 +452,13 @@ def _make_wm_low_replan_two_phase_fn(
             "observation/state": _pack_libero_proprio_vector(obs),
             "prompt": task_description,
         }
+        if task_c_trace.TRACE_KEY in _obs_snap:
+            # Preserve the original trigger-step identity on the mandatory
+            # fresh-VLM half of a low-kappa two-phase replan, but advance its
+            # simulator-step coordinate past the just-executed rollout.
+            low_replan_context = dict(_obs_snap[task_c_trace.TRACE_KEY])
+            low_replan_context["env_step"] = int(env_holder.get("task_c_sim_step", 0))
+            plain[task_c_trace.TRACE_KEY] = low_replan_context
         p2 = client.infer(plain)
         a2 = np.asarray(p2["actions"], dtype=np.float32)
         if a2.ndim != 2 or int(a2.shape[0]) != H:
@@ -513,10 +546,30 @@ class Args:
     video_out_path: str = "data/libero/videos"
     wm_confidence_jsonl: Optional[str] = None
     seed: int = 7
+    task_id_start: int = 0
+    task_id_count: Optional[int] = None
+    write_videos: bool = True
+    task_c_trace_dir: Optional[str] = None
+    task_c_run_id: Optional[str] = None
+    task_c_condition: Optional[str] = None
 
 
 def eval_libero(args: Args) -> None:
     np.random.seed(args.seed)
+
+    task_c_recorder = None
+    task_c_run_id = args.task_c_run_id or ""
+    task_c_condition = args.task_c_condition or ""
+    if args.task_c_trace_dir is not None:
+        if not args.task_c_run_id or not args.task_c_condition:
+            raise ValueError("task_c_trace_dir requires task_c_run_id and task_c_condition")
+        task_c_recorder = task_c_trace.ClientTraceRecorder(
+            pathlib.Path(args.task_c_trace_dir),
+            run_id=task_c_run_id,
+            condition=task_c_condition,
+        )
+    elif args.task_c_run_id is not None or args.task_c_condition is not None:
+        raise ValueError("task_c_run_id/task_c_condition require task_c_trace_dir")
 
     if args.async_use_world_model and not args.async_inference:
         raise ValueError("async_use_world_model=True requires async_inference=True")
@@ -607,6 +660,14 @@ def eval_libero(args: Args) -> None:
     num_tasks_in_suite = task_suite.n_tasks
     logging.info("Task suite: %s", args.task_suite_name)
 
+    if args.task_id_start < 0 or args.task_id_start >= num_tasks_in_suite:
+        raise ValueError(f"task_id_start must be in [0,{num_tasks_in_suite}), got {args.task_id_start}")
+    task_id_stop = num_tasks_in_suite
+    if args.task_id_count is not None:
+        if args.task_id_count < 1:
+            raise ValueError("task_id_count must be >= 1")
+        task_id_stop = min(num_tasks_in_suite, args.task_id_start + args.task_id_count)
+
     pathlib.Path(args.video_out_path).mkdir(parents=True, exist_ok=True)
 
     if args.task_suite_name == "libero_spatial":
@@ -624,7 +685,13 @@ def eval_libero(args: Args) -> None:
 
     client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
 
-    env_holder: dict = {"env": None, "task_description": ""}
+    env_holder: dict = {
+        "env": None,
+        "task_description": "",
+        "task_c_recorder": task_c_recorder,
+        "task_c_sim_step": 0,
+        "task_c_latest_obs": None,
+    }
     proprio_chunk_idx = None
     if args.async_inference:
         if args.async_use_proprio_state_at_h_minus_k:
@@ -718,7 +785,7 @@ def eval_libero(args: Args) -> None:
         suite_control_steps_success: list[int] = []
         per_task_mean_all: list[float] = []
         per_task_mean_success: list[float] = []
-        for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
+        for task_id in tqdm.tqdm(range(args.task_id_start, task_id_stop)):
             task = task_suite.get_task(task_id)
             initial_states = task_suite.get_task_init_states(task_id)
             env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
@@ -733,10 +800,13 @@ def eval_libero(args: Args) -> None:
                 chunk_policy.reset()
                 env.reset()
                 obs = env.set_init_state(initial_states[episode_idx])
+                env_holder["task_c_sim_step"] = 0
+                env_holder["task_c_latest_obs"] = obs
                 t = 0
                 replay_images = []
                 done = False
                 ep_control_steps = 0
+                episode_error: str | None = None
 
                 logging.info("Starting episode %d...", task_episodes + 1)
                 last_kappa_sig: tuple[float, ...] | None = None
@@ -762,6 +832,19 @@ def eval_libero(args: Args) -> None:
                             "observation/state": _pack_libero_proprio_vector(obs),
                             "prompt": str(task_description),
                         }
+                        step_trace_context = None
+                        if task_c_recorder is not None:
+                            step_trace_context = task_c_trace.trace_context(
+                                run_id=task_c_run_id,
+                                condition=task_c_condition,
+                                suite=args.task_suite_name,
+                                task_id=task_id,
+                                episode_idx=episode_idx,
+                                seed=args.seed,
+                                env_step=int(env_holder["task_c_sim_step"]),
+                            )
+                            infer_element[task_c_trace.TRACE_KEY] = step_trace_context
+                        env_holder["task_c_latest_obs"] = obs
 
                         policy_out = chunk_policy.infer(infer_element)
                         if args.wm_confidence_jsonl:
@@ -773,8 +856,33 @@ def eval_libero(args: Args) -> None:
                                     last_kappa_sig = sig
                                     ep_kappa_events.append(kap_list)
                         action = np.asarray(policy_out["actions"])
+                        latest_obs = env_holder.get("task_c_latest_obs") or obs
+                        state_before = _pack_libero_proprio_vector(latest_obs)
                         ep_control_steps += 1
                         obs, reward, done, info = env.step(action.tolist())
+                        env_holder["task_c_latest_obs"] = obs
+                        if task_c_recorder is not None:
+                            if step_trace_context is None:
+                                raise task_c_trace.TaskCTraceError("missing Task-C step trace context")
+                            action_trace_context = task_c_trace.trace_context(
+                                run_id=task_c_run_id,
+                                condition=task_c_condition,
+                                suite=args.task_suite_name,
+                                task_id=task_id,
+                                episode_idx=episode_idx,
+                                seed=args.seed,
+                                env_step=int(env_holder["task_c_sim_step"]),
+                            )
+                            task_c_recorder.record_step(
+                                action_trace_context,
+                                task_description=str(task_description),
+                                action=action,
+                                state_before=state_before,
+                                state_after=_pack_libero_proprio_vector(obs),
+                                done_after_step=bool(done),
+                                policy_kappa=policy_out.get("openpi/wm_confidence_kappa"),
+                            )
+                            env_holder["task_c_sim_step"] = int(env_holder["task_c_sim_step"]) + 1
                         if done:
                             task_successes += 1
                             total_successes += 1
@@ -782,6 +890,9 @@ def eval_libero(args: Args) -> None:
                         t += 1
                     except Exception as e:
                         logging.error("Caught exception: %s", e)
+                        episode_error = f"{type(e).__name__}: {e}"
+                        if task_c_recorder is not None:
+                            raise
                         break
 
                 task_control_steps_all.append(ep_control_steps)
@@ -793,11 +904,31 @@ def eval_libero(args: Args) -> None:
 
                 suffix = "success" if done else "failure"
                 task_segment = task_description.replace(" ", "_")
-                imageio.mimwrite(
-                    pathlib.Path(args.video_out_path) / f"rollout_{task_segment}_{suffix}.mp4",
-                    [np.asarray(x) for x in replay_images],
-                    fps=10,
-                )
+                if args.write_videos and replay_images:
+                    imageio.mimwrite(
+                        pathlib.Path(args.video_out_path) / f"rollout_{task_segment}_{suffix}.mp4",
+                        [np.asarray(x) for x in replay_images],
+                        fps=10,
+                    )
+
+                if task_c_recorder is not None:
+                    episode_context = task_c_trace.trace_context(
+                        run_id=task_c_run_id,
+                        condition=task_c_condition,
+                        suite=args.task_suite_name,
+                        task_id=task_id,
+                        episode_idx=episode_idx,
+                        seed=args.seed,
+                        env_step=0,
+                    )
+                    task_c_recorder.record_episode(
+                        episode_context,
+                        task_description=str(task_description),
+                        success=bool(done),
+                        control_steps=int(env_holder["task_c_sim_step"]),
+                        main_control_steps=ep_control_steps,
+                        error=episode_error,
+                    )
 
                 logging.info("Success: %s", done)
                 logging.info("# episodes completed so far: %d", total_episodes)

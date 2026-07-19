@@ -10,13 +10,15 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from openpi_client import base_policy as _base_policy
+from openpi_client import task_c_trace as _task_c_trace
 from typing_extensions import override
 
 from openpi.models import model as _model
 from openpi.models.pi0 import Pi0
-from openpi.models.pi0_world_model import Pi0FutureWorldModel, global_confidence_from_log_var
-import openpi.policies.policy as _policy
+from openpi.models.pi0_world_model import Pi0FutureWorldModel
+from openpi.models.pi0_world_model import global_confidence_from_log_var
 from openpi.policies import wm_inference_verify as _wm_verify
+import openpi.policies.policy as _policy
 from openpi.policies.wm_multi_rollout_schedule import wm_multi_rollout_adaptive_max_rounds
 import openpi.shared.nnx_utils as nnx_utils
 import openpi.transforms as transforms
@@ -133,6 +135,7 @@ class Pi0AsyncInferencePolicy(_base_policy.BasePolicy):
             self._wm_forward = jax.jit(_wm_jitted)
         else:
             self._wm_forward = None
+        self._task_c_trace = _task_c_trace.ServerTraceRecorder.from_env()
 
     @property
     def metadata(self) -> dict[str, Any]:
@@ -141,8 +144,11 @@ class Pi0AsyncInferencePolicy(_base_policy.BasePolicy):
     @override
     def infer(self, obs: dict) -> dict:
         d = dict(obs)
+        trace_context = d.pop(_task_c_trace.TRACE_KEY, None)
         meta = d.pop(ASYNC_KEY, None)
         if not isinstance(meta, dict) or not meta.get("use_world_model"):
+            if self._task_c_trace is not None:
+                self._task_c_trace.begin_policy_call(trace_context, kind="plain_vlm")
             return self._inner.infer(d)
         if self._wm_forward is None or self._world_model is None:
             logger.warning(
@@ -153,12 +159,28 @@ class Pi0AsyncInferencePolicy(_base_policy.BasePolicy):
         inputs = self._inner._input_transform(d)
         t0 = time.monotonic()
         used_wm_multi = isinstance(meta.get("wm_multi_rollout"), dict) and bool(meta["wm_multi_rollout"].get("enabled"))
+        policy_call_id = None
+        if self._task_c_trace is not None:
+            policy_call_id = self._task_c_trace.begin_policy_call(
+                trace_context,
+                kind="kappa_schedule" if used_wm_multi else "faac_refresh",
+            )
         wm_extras: dict[str, Any] = {}
         try:
             if used_wm_multi:
-                actions_batched, kappa_rounds, wm_extras = self._infer_wm_multi_rollout_ae(inputs, meta)
+                actions_batched, kappa_rounds, wm_extras = self._infer_wm_multi_rollout_ae(
+                    inputs,
+                    meta,
+                    trace_context=trace_context,
+                    policy_call_id=policy_call_id,
+                )
             else:
-                actions_batched, kappa_rounds = self._infer_with_world_model(inputs, meta)
+                actions_batched, kappa_rounds = self._infer_with_world_model(
+                    inputs,
+                    meta,
+                    trace_context=trace_context,
+                    policy_call_id=policy_call_id,
+                )
         except _LowKappaFullPi0Fallback as ex:
             logger.info(
                 "wm_multi_rollout adaptive low_replan: κ dropped below κ₀ - kappa_delta "
@@ -192,6 +214,11 @@ class Pi0AsyncInferencePolicy(_base_policy.BasePolicy):
                 "policy_timing": {"infer_ms": (time.monotonic() - t0) * 1000},
             }
         except Exception:
+            if self._task_c_trace is not None:
+                # A silent standard-Pi0 fallback would corrupt the scheduling
+                # comparison and leave missing mu/decision rows.  Trace runs
+                # therefore fail closed while legacy runs retain the fallback.
+                raise
             logger.exception("World model inference failed; falling back to standard Pi0.")
             out = self._inner.infer(d)
             if isinstance(out, dict):
@@ -228,7 +255,72 @@ class Pi0AsyncInferencePolicy(_base_policy.BasePolicy):
             )
         return outputs
 
-    def _infer_with_world_model(self, inputs: dict, meta: dict) -> tuple[jax.Array, jax.Array]:
+    def _forward_world_model_task_c(
+        self,
+        h_t: Any,
+        proprio: jax.Array,
+        ap_j: jax.Array,
+        mask_j: jax.Array,
+        delta: jax.Array,
+        k_wm: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, dict[str, Any] | None]:
+        if self._wm_forward is None:
+            raise RuntimeError("world-model forward is unavailable")
+        if self._task_c_trace is None:
+            mu, kappa = self._wm_forward(h_t, proprio, ap_j, mask_j, delta, k_wm)
+            return mu, kappa, None
+
+        started_ns = time.perf_counter_ns()
+        mu, kappa = self._wm_forward(h_t, proprio, ap_j, mask_j, delta, k_wm)
+        jax.block_until_ready((mu, kappa))
+        forward_done_ns = time.perf_counter_ns()
+        host_check_started_ns = time.perf_counter_ns()
+        kappa_float = float(np.asarray(jax.device_get(kappa.reshape(()))))
+        host_check_done_ns = time.perf_counter_ns()
+        mu_np = np.asarray(jax.device_get(mu), dtype=np.float16)
+        return mu, kappa, {
+            "mu": mu_np,
+            "kappa": kappa_float,
+            "wm_forward_kappa_ms": (forward_done_ns - started_ns) / 1_000_000.0,
+            "kappa_host_check_ms": (host_check_done_ns - host_check_started_ns) / 1_000_000.0,
+        }
+
+    def _record_task_c_wm(
+        self,
+        measurement: dict[str, Any] | None,
+        *,
+        trace_context: dict | None,
+        policy_call_id: str | None,
+        round_index: int,
+        decision: str,
+        decision_eligible: bool,
+        action_expert_executed: bool,
+    ) -> None:
+        if self._task_c_trace is None:
+            return
+        if measurement is None:
+            raise _task_c_trace.TaskCTraceError("missing Task-C world-model measurement")
+        self._task_c_trace.record_wm_call(
+            trace_context,
+            policy_call_id=policy_call_id,
+            round_index=round_index,
+            mu=measurement["mu"],
+            kappa=measurement["kappa"],
+            wm_forward_kappa_ms=measurement["wm_forward_kappa_ms"],
+            kappa_host_check_ms=measurement["kappa_host_check_ms"],
+            decision=decision,
+            decision_eligible=decision_eligible,
+            action_expert_executed=action_expert_executed,
+        )
+
+    def _infer_with_world_model(
+        self,
+        inputs: dict,
+        meta: dict,
+        *,
+        trace_context: dict | None = None,
+        policy_call_id: str | None = None,
+    ) -> tuple[jax.Array, jax.Array]:
         self._inner._rng, k_wm, k_sample = jax.random.split(self._inner._rng, 3)
         batched = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
         observation = _model.Observation.from_dict(batched)
@@ -261,7 +353,7 @@ class Pi0AsyncInferencePolicy(_base_policy.BasePolicy):
         delta = jnp.asarray([delta_t], dtype=jnp.float32)
         ap_j = jnp.asarray(ap)[jnp.newaxis, ...]
         mask_j = jnp.asarray(prefix_mask)[jnp.newaxis, ...]
-        mu, kappa = self._wm_forward(h_t, proprio, ap_j, mask_j, delta, k_wm)
+        mu, kappa, measurement = self._forward_world_model_task_c(h_t, proprio, ap_j, mask_j, delta, k_wm)
 
         ae_src = meta.get("ae_proprio_source")
         if ae_src is not None:
@@ -296,6 +388,15 @@ class Pi0AsyncInferencePolicy(_base_policy.BasePolicy):
             num_steps=self._inner._sample_kwargs.get("num_steps", 10),
             future_condition_tokens=mu,
         )
+        self._record_task_c_wm(
+            measurement,
+            trace_context=trace_context,
+            policy_call_id=policy_call_id,
+            round_index=0,
+            decision="faac_refresh",
+            decision_eligible=False,
+            action_expert_executed=True,
+        )
         return actions, jnp.reshape(kappa, (-1,))
 
     def _observation_for_ae_from_prefix(
@@ -315,7 +416,14 @@ class Pi0AsyncInferencePolicy(_base_policy.BasePolicy):
             return _model.Observation.from_dict({**batched, "state": state_ae})
         return observation
 
-    def _infer_wm_multi_rollout_ae(self, inputs: dict, meta: dict) -> tuple[jax.Array, jax.Array, dict[str, Any]]:
+    def _infer_wm_multi_rollout_ae(
+        self,
+        inputs: dict,
+        meta: dict,
+        *,
+        trace_context: dict | None = None,
+        policy_call_id: str | None = None,
+    ) -> tuple[jax.Array, jax.Array, dict[str, Any]]:
         mr = meta["wm_multi_rollout"]
         num_rounds = int(mr["num_rounds"])
         delta_t_wm = float(mr["delta_t"])
@@ -461,15 +569,29 @@ class Pi0AsyncInferencePolicy(_base_policy.BasePolicy):
                 raise RuntimeError(f"wm_multi_rollout: empty WM prefix at round r={r}")
             ap_j = ap_body[jnp.newaxis, ...]
             mask_j = jnp.ones((1, ap_body.shape[0]), dtype=jnp.bool_)
-            mu, kappa = self._wm_forward(h_t, proprio, ap_j, mask_j, delta, k_wm)
+            mu, kappa, measurement = self._forward_world_model_task_c(h_t, proprio, ap_j, mask_j, delta, k_wm)
             kappa_per_round.append(kappa.reshape(()))
-            k_f = float(np.asarray(jax.device_get(kappa.reshape(()))))
+            k_f = (
+                float(measurement["kappa"])
+                if measurement is not None
+                else float(np.asarray(jax.device_get(kappa.reshape(()))))
+            )
+            decision = "seed_round" if r == 0 else "skip_vlm"
             if adaptive:
                 if r == 0:
                     kappa0_f = k_f
                 elif kappa0_f is not None:
                     if low_replan:
                         if k_f < kappa0_f - kappa_th:
+                            self._record_task_c_wm(
+                                measurement,
+                                trace_context=trace_context,
+                                policy_call_id=policy_call_id,
+                                round_index=r,
+                                decision="infer_vlm",
+                                decision_eligible=True,
+                                action_expert_executed=False,
+                            )
                             kappa_np = np.asarray(
                                 jax.device_get(jnp.stack(kappa_per_round, axis=0)), dtype=np.float32
                             ).reshape(-1)
@@ -489,6 +611,15 @@ class Pi0AsyncInferencePolicy(_base_policy.BasePolicy):
                                 glue_actions_model=np.asarray(jax.device_get(glue_w), dtype=np.float32),
                             )
                     elif k_f > kappa0_f + kappa_th:
+                        self._record_task_c_wm(
+                            measurement,
+                            trace_context=trace_context,
+                            policy_call_id=policy_call_id,
+                            round_index=r,
+                            decision="infer_vlm",
+                            decision_eligible=True,
+                            action_expert_executed=False,
+                        )
                         early_exec_len = overlap + delta_idx * (r - 1)
                         break
 
@@ -525,6 +656,15 @@ class Pi0AsyncInferencePolicy(_base_policy.BasePolicy):
             if start >= h:
                 raise RuntimeError(f"wm_multi_rollout: merge start {start} >= H {h} at r={r}")
             working = working.at[start:h].set(ae_actions[0, start:h, ...])
+            self._record_task_c_wm(
+                measurement,
+                trace_context=trace_context,
+                policy_call_id=policy_call_id,
+                round_index=r,
+                decision=decision,
+                decision_eligible=r > 0,
+                action_expert_executed=True,
+            )
 
         extras: dict[str, Any] = {"wm_stitch_n": int(len(kappa_per_round))}
         if adaptive:
