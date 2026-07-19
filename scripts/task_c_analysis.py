@@ -381,14 +381,20 @@ def _phase_map_from_labeled_steps(root: pathlib.Path) -> dict[tuple[str, int], s
     return {(str(step["trajectory_id"]), int(step["env_step"])): str(step["phase"]) for step in steps}
 
 
-def aggregate_c1(c1_root: pathlib.Path, condition_roots: Mapping[str, pathlib.Path]) -> dict[str, Any]:
-    required = {"faac_only", "kappa_0p2", "kappa_0p4", "kappa_0p8"}
+def _aggregate_paired_experiment(
+    output_root: pathlib.Path,
+    condition_roots: Mapping[str, pathlib.Path],
+    *,
+    suite: str,
+    experiment: str,
+    required: set[str],
+) -> dict[str, Any]:
     if set(condition_roots) != required:
         raise task_c_trace.TaskCTraceError(
-            f"C1 requires condition roots {sorted(required)}, got {sorted(condition_roots)}"
+            f"{experiment} requires condition roots {sorted(required)}, got {sorted(condition_roots)}"
         )
-    c1_root = c1_root.resolve()
-    c1_root.mkdir(parents=True, exist_ok=True)
+    output_root = output_root.resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
     baseline = task_c_trace.read_jsonl(condition_roots["faac_only"] / "episodes.jsonl")
 
     expected_tasks = set(range(10))
@@ -396,24 +402,26 @@ def aggregate_c1(c1_root: pathlib.Path, condition_roots: Mapping[str, pathlib.Pa
     for condition, root in sorted(condition_roots.items()):
         episodes = task_c_trace.read_jsonl(root / "episodes.jsonl")
         if len(episodes) != 300:
-            raise task_c_trace.TaskCTraceError(f"C1 {condition} must contain exactly 300 episodes, got {len(episodes)}")
+            raise task_c_trace.TaskCTraceError(
+                f"{experiment} {condition} must contain exactly 300 episodes, got {len(episodes)}"
+            )
         task_ids = {int(item["task_id"]) for item in episodes}
         if task_ids != expected_tasks:
-            raise task_c_trace.TaskCTraceError(f"C1 {condition} task ids {sorted(task_ids)} != 0..9")
-        if any(str(item["suite"]) != "libero_spatial" or int(item["seed"]) != 42 for item in episodes):
-            raise task_c_trace.TaskCTraceError(f"C1 {condition} must use libero_spatial and seed 42")
+            raise task_c_trace.TaskCTraceError(f"{experiment} {condition} task ids {sorted(task_ids)} != 0..9")
+        if any(str(item["suite"]) != suite or int(item["seed"]) != 42 for item in episodes):
+            raise task_c_trace.TaskCTraceError(f"{experiment} {condition} must use {suite} and seed 42")
         for task_id in sorted(expected_tasks):
             task_episodes = [item for item in episodes if int(item["task_id"]) == task_id]
             episode_indices = {int(item["episode_idx"]) for item in task_episodes}
             if len(task_episodes) != 30 or episode_indices != set(range(30)):
                 raise task_c_trace.TaskCTraceError(
-                    f"C1 {condition} task {task_id} must contain episode_idx 0..29 exactly once"
+                    f"{experiment} {condition} task {task_id} must contain episode_idx 0..29 exactly once"
                 )
         trajectory_ids = {str(item["trajectory_id"]) for item in episodes}
         if expected_trajectory_ids is None:
             expected_trajectory_ids = trajectory_ids
         elif trajectory_ids != expected_trajectory_ids:
-            raise task_c_trace.TaskCTraceError(f"C1 {condition} is not paired to the baseline trajectory set")
+            raise task_c_trace.TaskCTraceError(f"{experiment} {condition} is not paired to the baseline trajectory set")
     condition_summaries: dict[str, Any] = {}
     paired: dict[str, Any] = {}
     all_mu_indexes: list[dict[str, Any]] = []
@@ -479,19 +487,21 @@ def aggregate_c1(c1_root: pathlib.Path, condition_roots: Mapping[str, pathlib.Pa
         "unique_eval_trajectories": sum(value == "eval" for value in split_by_trajectory.values()),
         "shards": mu_shards,
     }
-    task_c_trace.write_json_atomic(c1_root / "mu_shards.json", mu_manifest)
+    task_c_trace.write_json_atomic(output_root / "mu_shards.json", mu_manifest)
     summary = {
         "schema_version": task_c_trace.SCHEMA_VERSION,
-        "experiment": "C1_libero_spatial_k9",
+        "experiment": experiment,
+        "suite": suite,
         "conditions": condition_summaries,
         "paired": paired,
         "mu_shards_manifest": "mu_shards.json",
-        "mu_shards_manifest_sha256": task_c_trace.sha256_file(c1_root / "mu_shards.json"),
+        "mu_shards_manifest_sha256": task_c_trace.sha256_file(output_root / "mu_shards.json"),
     }
-    task_c_trace.write_json_atomic(c1_root / "summary.json", summary)
+    task_c_trace.write_json_atomic(output_root / "summary.json", summary)
     run_manifest = {
         "schema_version": task_c_trace.SCHEMA_VERSION,
-        "experiment": "C1_libero_spatial_k9",
+        "experiment": experiment,
+        "suite": suite,
         "status": "complete",
         "condition_receipts": {
             condition: {
@@ -500,12 +510,39 @@ def aggregate_c1(c1_root: pathlib.Path, condition_roots: Mapping[str, pathlib.Pa
             }
             for condition, root in sorted(condition_roots.items())
         },
-        "summary_sha256": task_c_trace.sha256_file(c1_root / "summary.json"),
-        "mu_shards_manifest_sha256": task_c_trace.sha256_file(c1_root / "mu_shards.json"),
+        "summary_sha256": task_c_trace.sha256_file(output_root / "summary.json"),
+        "mu_shards_manifest_sha256": task_c_trace.sha256_file(output_root / "mu_shards.json"),
     }
-    task_c_trace.write_json_atomic(c1_root / "run_manifest.json", run_manifest)
-    _, manifest_sha = _write_sha_manifest(c1_root)
+    task_c_trace.write_json_atomic(output_root / "run_manifest.json", run_manifest)
+    _, manifest_sha = _write_sha_manifest(output_root)
     return {**summary, "receipt_manifest_sha256": manifest_sha}
+
+
+def aggregate_c1(c1_root: pathlib.Path, condition_roots: Mapping[str, pathlib.Path]) -> dict[str, Any]:
+    return _aggregate_paired_experiment(
+        c1_root,
+        condition_roots,
+        suite="libero_spatial",
+        experiment="C1_libero_spatial_k9",
+        required={"faac_only", "kappa_0p2", "kappa_0p4", "kappa_0p8"},
+    )
+
+
+def aggregate_paired_suite(
+    output_root: pathlib.Path,
+    condition_roots: Mapping[str, pathlib.Path],
+    *,
+    suite: str,
+) -> dict[str, Any]:
+    if suite not in {"libero_object", "libero_goal", "libero_10"}:
+        raise task_c_trace.TaskCTraceError(f"C3 requires a harder LIBERO suite, got {suite!r}")
+    return _aggregate_paired_experiment(
+        output_root,
+        condition_roots,
+        suite=suite,
+        experiment=f"C3_{suite}_k9",
+        required={"faac_only", "kappa_0p4"},
+    )
 
 
 def _parse_args() -> argparse.Namespace:
@@ -519,6 +556,11 @@ def _parse_args() -> argparse.Namespace:
     aggregate.add_argument("--kappa-0p2", type=pathlib.Path, required=True)
     aggregate.add_argument("--kappa-0p4", type=pathlib.Path, required=True)
     aggregate.add_argument("--kappa-0p8", type=pathlib.Path, required=True)
+    paired = subparsers.add_parser("aggregate-paired-suite")
+    paired.add_argument("output", type=pathlib.Path)
+    paired.add_argument("--suite", choices=("libero_object", "libero_goal", "libero_10"), required=True)
+    paired.add_argument("--faac-only", type=pathlib.Path, required=True)
+    paired.add_argument("--kappa-0p4", type=pathlib.Path, required=True)
     return parser.parse_args()
 
 
@@ -526,7 +568,7 @@ def main() -> None:
     args = _parse_args()
     if args.command == "finalize-condition":
         result = finalize_condition(args.output)
-    else:
+    elif args.command == "aggregate-c1":
         result = aggregate_c1(
             args.output,
             {
@@ -535,6 +577,15 @@ def main() -> None:
                 "kappa_0p4": args.kappa_0p4,
                 "kappa_0p8": args.kappa_0p8,
             },
+        )
+    else:
+        result = aggregate_paired_suite(
+            args.output,
+            {
+                "faac_only": args.faac_only,
+                "kappa_0p4": args.kappa_0p4,
+            },
+            suite=args.suite,
         )
     print(json.dumps(result, sort_keys=True))
 

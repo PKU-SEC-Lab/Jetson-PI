@@ -30,6 +30,7 @@ CONDITIONS = {
     "kappa_0p4": 0.4,
     "kappa_0p8": 0.8,
 }
+SUITES = ("libero_spatial", "libero_object", "libero_goal", "libero_10")
 
 
 def _now() -> str:
@@ -365,6 +366,7 @@ def run_condition(
     checkpoint_manifest_path: pathlib.Path,
     preflight_receipt_path: pathlib.Path,
     condition: str,
+    suite: str,
     output: pathlib.Path,
     trials_per_task: int,
     task_id_start: int,
@@ -374,13 +376,16 @@ def run_condition(
 ) -> dict[str, Any]:
     if condition not in CONDITIONS:
         raise ValueError(f"unknown condition {condition!r}")
+    if suite not in SUITES:
+        raise ValueError(f"unknown suite {suite!r}")
     output = output.resolve()
     if output.exists() and any(output.iterdir()):
         raise task_c_trace.TaskCTraceError(f"refusing to overwrite non-empty condition output: {output}")
     output.mkdir(parents=True, exist_ok=True)
     (output / "server_trace").mkdir()
     (output / "videos").mkdir()
-    run_id = f"c1-{condition}-seed{seed}-tasks{task_id_start}-{task_id_start + task_id_count - 1}"
+    experiment = "C1_libero_spatial_k9" if suite == "libero_spatial" else f"C3_{suite}_k9"
+    run_id = f"{experiment.lower()}-{condition}-seed{seed}-tasks{task_id_start}-{task_id_start + task_id_count - 1}"
     port = _find_port()
     provenance = output / "provenance"
     checkpoint_verification = verify_checkpoint_manifest(checkpoint.parent, checkpoint_manifest_path)
@@ -401,8 +406,8 @@ def run_condition(
         "run_id": run_id,
         "condition": condition,
         "kappa_delta": CONDITIONS[condition],
-        "experiment": "C1_libero_spatial_k9",
-        "suite": "libero_spatial",
+        "experiment": experiment,
+        "suite": suite,
         "seed": seed,
         "task_id_start": task_id_start,
         "task_id_count": task_id_count,
@@ -429,6 +434,8 @@ def run_condition(
             "root": str(wm_checkpoint),
             "token_reducer_kind": "learned_cross_attn",
             "action_encoder_kind": "transformer_block",
+            "training_suite": "libero_spatial",
+            "out_of_training_suite": suite != "libero_spatial",
         },
         "repo": _git_receipt(repo),
         "device": _device_receipt(cuda_device),
@@ -496,7 +503,7 @@ def run_condition(
         "--port",
         str(port),
         "--task-suite-name",
-        "libero_spatial",
+        suite,
         "--num-trials-per-task",
         str(trials_per_task),
         "--task-id-start",
@@ -626,6 +633,7 @@ def _parse_args() -> argparse.Namespace:
     preflight_parser.add_argument("--out", type=pathlib.Path, default=root / "preflight")
     run_parser = subparsers.add_parser("run-condition")
     run_parser.add_argument("--condition", choices=sorted(CONDITIONS), required=True)
+    run_parser.add_argument("--suite", choices=SUITES, default="libero_spatial")
     run_parser.add_argument("--out", type=pathlib.Path, required=True)
     run_parser.add_argument("--trials-per-task", type=int, default=30)
     run_parser.add_argument("--task-id-start", type=int, default=0)
@@ -662,6 +670,7 @@ def main() -> None:
             checkpoint_manifest_path=args.artifact_root / "provenance" / "checkpoint_manifest.json",
             preflight_receipt_path=args.preflight_receipt,
             condition=args.condition,
+            suite=args.suite,
             output=args.out,
             trials_per_task=args.trials_per_task,
             task_id_start=args.task_id_start,

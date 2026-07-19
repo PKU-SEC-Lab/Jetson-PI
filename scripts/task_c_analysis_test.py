@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import sys
 
 import numpy as np
 from openpi_client import task_c_trace
@@ -10,16 +11,21 @@ import pytest
 from scripts import task_c_analysis
 
 
-def _context(*, episode_idx: int, env_step: int = 0) -> dict:
+def _context(*, episode_idx: int, env_step: int = 0, suite: str = "libero_spatial", task_id: int = 0) -> dict:
     return task_c_trace.trace_context(
         run_id="test-run",
         condition="kappa_0p4",
-        suite="libero_spatial",
-        task_id=0,
+        suite=suite,
+        task_id=task_id,
         episode_idx=episode_idx,
         seed=42,
         env_step=env_step,
     )
+
+
+def _write_jsonl(path: pathlib.Path, records: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"".join(task_c_trace.canonical_json_bytes(record) + b"\n" for record in records))
 
 
 def test_trace_context_is_condition_independent_and_disjoint() -> None:
@@ -164,6 +170,75 @@ def test_c1_aggregate_rejects_an_incomplete_design(tmp_path: pathlib.Path) -> No
 
     with pytest.raises(task_c_trace.TaskCTraceError, match="exactly 300 episodes"):
         task_c_analysis.aggregate_c1(tmp_path / "aggregate", roots)
+
+
+def test_paired_suite_aggregate_accepts_exact_c3_design(tmp_path: pathlib.Path) -> None:
+    roots: dict[str, pathlib.Path] = {}
+    for condition in ("faac_only", "kappa_0p4"):
+        root = tmp_path / condition
+        episodes: list[dict] = []
+        calls: list[dict] = []
+        steps: list[dict] = []
+        for task_id in range(10):
+            for episode_idx in range(30):
+                context = _context(
+                    episode_idx=episode_idx,
+                    suite="libero_object",
+                    task_id=task_id,
+                )
+                episodes.append({**context, "condition": condition, "success": True})
+                if condition == "kappa_0p4":
+                    calls.append(
+                        {
+                            **context,
+                            "condition": condition,
+                            "decision_eligible": True,
+                            "decision": "skip_vlm",
+                        }
+                    )
+                    steps.append({**context, "condition": condition, "phase": "approach"})
+        _write_jsonl(root / "episodes.jsonl", episodes)
+        _write_jsonl(root / "server_trace" / "wm_calls.jsonl", calls)
+        _write_jsonl(root / "steps_labeled.jsonl", steps)
+        _write_jsonl(root / "mu" / "calibration" / "index.jsonl", [])
+        _write_jsonl(root / "mu" / "eval" / "index.jsonl", [])
+        (root / "summary.json").write_text("{}\n", encoding="utf-8")
+        (root / "SHA256SUMS").write_text("", encoding="utf-8")
+        roots[condition] = root
+
+    result = task_c_analysis.aggregate_paired_suite(
+        tmp_path / "aggregate",
+        roots,
+        suite="libero_object",
+    )
+
+    assert result["experiment"] == "C3_libero_object_k9"
+    assert result["suite"] == "libero_object"
+    assert result["paired"]["kappa_0p4"]["validity_gate_pass"] is True
+    assert result["paired"]["kappa_0p4"]["deployable_valid_skip_rate"] == 1.0
+
+
+def test_paired_suite_aggregate_cli_accepts_c3_inputs(monkeypatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "task_c_analysis.py",
+            "aggregate-paired-suite",
+            "/tmp/c3-object/aggregate",
+            "--suite",
+            "libero_object",
+            "--faac-only",
+            "/tmp/c3-object/faac_only",
+            "--kappa-0p4",
+            "/tmp/c3-object/kappa_0p4",
+        ],
+    )
+
+    args = task_c_analysis._parse_args()  # noqa: SLF001 - exercise the public CLI parser
+
+    assert args.command == "aggregate-paired-suite"
+    assert args.suite == "libero_object"
 
 
 def test_finalize_condition_emits_required_schema(tmp_path: pathlib.Path) -> None:
