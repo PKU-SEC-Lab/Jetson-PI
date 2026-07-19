@@ -88,6 +88,42 @@ def test_exact_mcnemar_and_noninferiority_are_paired() -> None:
     assert interval["success_rate_delta"] == pytest.approx(-2 / 30)
 
 
+def test_valid_skip_rate_requires_preserved_paired_success() -> None:
+    baseline = []
+    candidate = []
+    calls = []
+    phase_map = {}
+    for episode_idx in range(30):
+        context = _context(episode_idx=episode_idx)
+        episode = {**context, "success": True}
+        baseline.append(episode)
+        candidate.append(episode)
+        phase = "approach" if episode_idx < 15 else "contact"
+        phase_map[(context["trajectory_id"], 0)] = phase
+        calls.append(
+            {
+                **context,
+                "decision_eligible": True,
+                "decision": "skip_vlm",
+            }
+        )
+
+    result = task_c_analysis._paired_result(  # noqa: SLF001 - verify the analysis contract directly
+        baseline,
+        candidate,
+        calls,
+        phase_map,
+        bootstrap_seed=42,
+    )
+
+    assert result["validity_gate_pass"] is True
+    assert result["raw_skip"]["skip_rate"] == 1.0
+    assert result["success_conditioned_skip"]["skip_rate"] == 1.0
+    assert result["deployable_valid_skip_rate"] == 1.0
+    assert result["per_phase"]["approach"]["deployable_valid_skip_rate"] == 1.0
+    assert result["per_phase"]["contact"]["deployable_valid_skip_rate"] == 1.0
+
+
 def test_finalize_condition_emits_required_schema(tmp_path: pathlib.Path) -> None:
     manifest = {
         "schema_version": task_c_trace.SCHEMA_VERSION,
