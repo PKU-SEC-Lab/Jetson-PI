@@ -17,7 +17,7 @@ uv pip install --python "${POLICY_ENV}/bin/python" 'pytest>=8,<9'
 TRANSFORMERS_DIR="$("${POLICY_ENV}/bin/python" -c 'import pathlib, transformers; print(pathlib.Path(transformers.__file__).parent)')"
 cp -r "${REPO}/src/openpi/models_pytorch/transformers_replace/." "${TRANSFORMERS_DIR}/"
 
-uv venv --python 3.11 "${LIBERO_ENV}"
+uv venv --clear --python 3.11 "${LIBERO_ENV}"
 uv pip sync --python "${LIBERO_ENV}/bin/python" \
   --index-url https://download.pytorch.org/whl/cpu \
   --extra-index-url https://pypi.org/simple \
