@@ -12,6 +12,7 @@
   <p>
     <a href="https://arxiv.org/abs/2607.12659"><img src="https://img.shields.io/badge/arXiv-2607.12659-b31b1b.svg" alt="arXiv" /></a>
     <a href="https://github.com/PKU-SEC-Lab/Jetson-PI"><img src="https://img.shields.io/badge/Code-Jetson--PI-35b8a9.svg" alt="Jetson-PI code" /></a>
+    <a href="https://www.modelscope.cn/models/zebinyang/Jetson-PI-pi05"><img src="https://img.shields.io/badge/Model-Jetson--PI--pi05-624AFF.svg" alt="Jetson-PI pi05 model" /></a>
     <a href="https://github.com/PKU-SEC-Lab/Jetson-PI-Edge"><img src="https://img.shields.io/badge/Runtime-Jetson--PI--Edge-3578c8.svg" alt="Jetson-PI-Edge runtime" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache--2.0-f28c45.svg" alt="Apache-2.0 license" /></a>
   </p>
