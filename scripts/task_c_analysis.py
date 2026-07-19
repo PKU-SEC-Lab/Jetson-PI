@@ -1,4 +1,4 @@
-"""Finalize and analyze Jetson-PI Task-C C1 scheduling receipts."""
+"""Finalize and analyze paired Jetson-PI Task-C scheduling receipts."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from openpi_client import task_c_trace
 
 MU_ROWS_PER_SHARD = 4096
 NONINFERIORITY_MARGIN = -0.05
+C3_SUITES = ("libero_object", "libero_goal", "libero_10")
 
 
 def _write_jsonl(path: pathlib.Path, records: Iterable[Mapping[str, Any]]) -> None:
@@ -41,6 +42,79 @@ def _write_sha_manifest(root: pathlib.Path, *, filename: str = "SHA256SUMS") -> 
     return manifest, task_c_trace.sha256_file(manifest)
 
 
+def _verify_sha_manifest(root: pathlib.Path, *, filename: str = "SHA256SUMS") -> str:
+    root = root.resolve()
+    manifest = root / filename
+    if not manifest.is_file():
+        raise task_c_trace.TaskCTraceError(f"missing receipt manifest: {manifest}")
+    expected: dict[str, str] = {}
+    for line in manifest.read_text(encoding="utf-8").splitlines():
+        digest, separator, relative = line.partition("  ")
+        try:
+            valid_digest = len(digest) == 64 and int(digest, 16) >= 0
+        except ValueError:
+            valid_digest = False
+        relative_path = pathlib.PurePosixPath(relative)
+        if (
+            separator != "  "
+            or not valid_digest
+            or not relative
+            or relative_path.is_absolute()
+            or ".." in relative_path.parts
+            or relative in expected
+        ):
+            raise task_c_trace.TaskCTraceError(f"invalid receipt manifest line: {line!r}")
+        expected[relative] = digest
+    actual_paths = {
+        path.relative_to(root).as_posix(): path
+        for path in root.rglob("*")
+        if path.is_file() and path.resolve() != manifest.resolve() and ".tmp-" not in path.name
+    }
+    if set(actual_paths) != set(expected):
+        raise task_c_trace.TaskCTraceError(
+            f"receipt file set mismatch: missing={sorted(set(expected) - set(actual_paths))}, "
+            f"extra={sorted(set(actual_paths) - set(expected))}"
+        )
+    for relative, path in sorted(actual_paths.items()):
+        actual = task_c_trace.sha256_file(path)
+        if actual != expected[relative]:
+            raise task_c_trace.TaskCTraceError(f"SHA-256 mismatch for {path}: {actual} != {expected[relative]}")
+    return task_c_trace.sha256_file(manifest)
+
+
+def _verify_c3_condition_contract(root: pathlib.Path, *, condition: str, suite: str) -> None:
+    manifest_path = root / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    expected = {
+        "status": "complete",
+        "condition": condition,
+        "suite": suite,
+        "experiment": f"C3_{suite}_k9",
+        "trigger_k": 9,
+        "action_horizon": 10,
+        "seed": 42,
+        "task_id_start": 0,
+        "task_id_count": 10,
+        "trials_per_task": 30,
+        "expected_episodes": 300,
+        "actual_episodes": 300,
+        "overlap": 1,
+        "wm_delta_t": 1.0,
+        "confidence_schedule": condition == "kappa_0p4",
+        "kappa_delta": 0.4 if condition == "kappa_0p4" else None,
+    }
+    for field, expected_value in expected.items():
+        if manifest.get(field) != expected_value:
+            raise task_c_trace.TaskCTraceError(
+                f"C3 {condition} manifest {field}={manifest.get(field)!r} != {expected_value!r}"
+            )
+    world_model = manifest.get("world_model")
+    if not isinstance(world_model, dict):
+        raise task_c_trace.TaskCTraceError(f"C3 {condition} manifest has no world_model receipt")
+    if world_model.get("training_suite") != "libero_spatial" or world_model.get("out_of_training_suite") is not True:
+        raise task_c_trace.TaskCTraceError(f"C3 {condition} is not labeled WM-out-of-training-suite")
+
+
 def _unique_by(records: Sequence[Mapping[str, Any]], key: str) -> dict[str, Mapping[str, Any]]:
     out: dict[str, Mapping[str, Any]] = {}
     for record in records:
@@ -49,6 +123,15 @@ def _unique_by(records: Sequence[Mapping[str, Any]], key: str) -> dict[str, Mapp
             raise task_c_trace.TaskCTraceError(f"duplicate {key}: {value}")
         out[value] = record
     return out
+
+
+def _count_kappa_decisions(calls: Sequence[Mapping[str, Any]]) -> tuple[int, int]:
+    invalid = [str(call.get("decision")) for call in calls if call.get("decision") not in {"skip_vlm", "infer_vlm"}]
+    if invalid:
+        raise task_c_trace.TaskCTraceError(f"unexpected eligible decision labels: {sorted(set(invalid))}")
+    skipped = sum(call["decision"] == "skip_vlm" for call in calls)
+    reinferred = sum(call["decision"] == "infer_vlm" for call in calls)
+    return skipped, reinferred
 
 
 def _validate_mu_and_write_shards(
@@ -149,11 +232,13 @@ def _phase_counts(
             for call in eligible_calls
             if phase_by_key[(str(call["trajectory_id"]), int(call["env_step"]))] == phase
         ]
-        skipped = sum(call["decision"] == "skip_vlm" for call in calls)
+        skipped, reinferred = _count_kappa_decisions(calls)
         output[phase] = {
             "eligible_decisions": len(calls),
             "skip_decisions": skipped,
-            "infer_decisions": len(calls) - skipped,
+            "infer_decisions": reinferred,
+            "kappa_forced_reinfer_count": reinferred,
+            "kappa_ever_forced_reinfer": reinferred > 0,
             "raw_skip_rate": task_c_trace.ratio(skipped, len(calls)),
         }
     return output
@@ -234,7 +319,7 @@ def finalize_condition(output_root: pathlib.Path) -> dict[str, Any]:
     if not measured_timing:
         raise task_c_trace.TaskCTraceError("no measured C_tier0 calls remain after warmup exclusion")
     eligible = [call for call in wm_calls if call["decision_eligible"]]
-    skips = sum(call["decision"] == "skip_vlm" for call in eligible)
+    skips, reinfers = _count_kappa_decisions(eligible)
     rounds_by_policy: dict[str, int] = defaultdict(int)
     for call in wm_calls:
         rounds_by_policy[str(call["policy_call_id"])] += 1
@@ -260,7 +345,9 @@ def finalize_condition(output_root: pathlib.Path) -> dict[str, Any]:
         "scheduling": {
             "eligible_decisions": len(eligible),
             "skip_decisions": skips,
-            "infer_decisions": len(eligible) - skips,
+            "infer_decisions": reinfers,
+            "kappa_forced_reinfer_count": reinfers,
+            "kappa_ever_forced_reinfer": reinfers > 0,
             "raw_skip_rate": task_c_trace.ratio(skips, len(eligible)),
             "mean_wm_ae_rounds_per_wm_conditioned_vlm_call": (
                 float(np.mean(list(rounds_by_policy.values()))) if rounds_by_policy else None
@@ -303,11 +390,13 @@ def _decision_stats(
         selected = [
             call for call in selected if phase_by_key[(str(call["trajectory_id"]), int(call["env_step"]))] == phase
         ]
-    skipped = sum(call["decision"] == "skip_vlm" for call in selected)
+    skipped, reinferred = _count_kappa_decisions(selected)
     return {
         "eligible_decisions": len(selected),
         "skip_decisions": skipped,
-        "infer_decisions": len(selected) - skipped,
+        "infer_decisions": reinferred,
+        "kappa_forced_reinfer_count": reinferred,
+        "kappa_ever_forced_reinfer": reinferred > 0,
         "skip_rate": task_c_trace.ratio(skipped, len(selected)),
     }
 
@@ -492,6 +581,8 @@ def _aggregate_paired_experiment(
         "schema_version": task_c_trace.SCHEMA_VERSION,
         "experiment": experiment,
         "suite": suite,
+        "world_model_training_suite": "libero_spatial",
+        "wm_out_of_training_suite": suite != "libero_spatial",
         "conditions": condition_summaries,
         "paired": paired,
         "mu_shards_manifest": "mu_shards.json",
@@ -502,6 +593,8 @@ def _aggregate_paired_experiment(
         "schema_version": task_c_trace.SCHEMA_VERSION,
         "experiment": experiment,
         "suite": suite,
+        "world_model_training_suite": "libero_spatial",
+        "wm_out_of_training_suite": suite != "libero_spatial",
         "status": "complete",
         "condition_receipts": {
             condition: {
@@ -534,8 +627,16 @@ def aggregate_paired_suite(
     *,
     suite: str,
 ) -> dict[str, Any]:
-    if suite not in {"libero_object", "libero_goal", "libero_10"}:
+    if suite not in C3_SUITES:
         raise task_c_trace.TaskCTraceError(f"C3 requires a harder LIBERO suite, got {suite!r}")
+    required = {"faac_only", "kappa_0p4"}
+    if set(condition_roots) != required:
+        raise task_c_trace.TaskCTraceError(
+            f"C3_{suite}_k9 requires condition roots {sorted(required)}, got {sorted(condition_roots)}"
+        )
+    for condition, root in condition_roots.items():
+        _verify_sha_manifest(root)
+        _verify_c3_condition_contract(root, condition=condition, suite=suite)
     return _aggregate_paired_experiment(
         output_root,
         condition_roots,
@@ -558,7 +659,7 @@ def _parse_args() -> argparse.Namespace:
     aggregate.add_argument("--kappa-0p8", type=pathlib.Path, required=True)
     paired = subparsers.add_parser("aggregate-paired-suite")
     paired.add_argument("output", type=pathlib.Path)
-    paired.add_argument("--suite", choices=("libero_object", "libero_goal", "libero_10"), required=True)
+    paired.add_argument("--suite", choices=C3_SUITES, required=True)
     paired.add_argument("--faac-only", type=pathlib.Path, required=True)
     paired.add_argument("--kappa-0p4", type=pathlib.Path, required=True)
     return parser.parse_args()

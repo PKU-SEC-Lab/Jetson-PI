@@ -1,4 +1,4 @@
-"""Stage, preflight, and run the gated Jetson-PI Task-C C1 experiment."""
+"""Stage, preflight, and run gated Jetson-PI Task-C experiments."""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ CONDITIONS = {
     "kappa_0p4": 0.4,
     "kappa_0p8": 0.8,
 }
-SUITES = ("libero_spatial", "libero_object", "libero_goal", "libero_10")
+SUITES = ("libero_spatial", *task_c_analysis.C3_SUITES)
 
 
 def _now() -> str:

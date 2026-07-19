@@ -28,6 +28,64 @@ def _write_jsonl(path: pathlib.Path, records: list[dict]) -> None:
     path.write_bytes(b"".join(task_c_trace.canonical_json_bytes(record) + b"\n" for record in records))
 
 
+def _paired_suite_roots(tmp_path: pathlib.Path, *, suite: str = "libero_object") -> dict[str, pathlib.Path]:
+    roots: dict[str, pathlib.Path] = {}
+    for condition in ("faac_only", "kappa_0p4"):
+        root = tmp_path / condition
+        episodes: list[dict] = []
+        calls: list[dict] = []
+        steps: list[dict] = []
+        for task_id in range(10):
+            for episode_idx in range(30):
+                context = _context(episode_idx=episode_idx, suite=suite, task_id=task_id)
+                episodes.append({**context, "condition": condition, "success": True})
+                if condition == "kappa_0p4":
+                    calls.append(
+                        {
+                            **context,
+                            "condition": condition,
+                            "decision_eligible": True,
+                            "decision": "skip_vlm",
+                        }
+                    )
+                    steps.append({**context, "condition": condition, "phase": "approach"})
+        _write_jsonl(root / "episodes.jsonl", episodes)
+        _write_jsonl(root / "server_trace" / "wm_calls.jsonl", calls)
+        _write_jsonl(root / "steps_labeled.jsonl", steps)
+        _write_jsonl(root / "mu" / "calibration" / "index.jsonl", [])
+        _write_jsonl(root / "mu" / "eval" / "index.jsonl", [])
+        (root / "summary.json").write_text("{}\n", encoding="utf-8")
+        task_c_trace.write_json_atomic(
+            root / "run_manifest.json",
+            {
+                "status": "complete",
+                "condition": condition,
+                "suite": suite,
+                "experiment": f"C3_{suite}_k9",
+                "trigger_k": 9,
+                "action_horizon": 10,
+                "seed": 42,
+                "task_id_start": 0,
+                "task_id_count": 10,
+                "trials_per_task": 30,
+                "expected_episodes": 300,
+                "actual_episodes": 300,
+                "overlap": 1,
+                "wm_delta_t": 1.0,
+                "kappa_delta": None if condition == "faac_only" else 0.4,
+                "confidence_schedule": condition != "faac_only",
+                "world_model": {
+                    "training_suite": "libero_spatial",
+                    "out_of_training_suite": True,
+                },
+            },
+        )
+        (root / "client.log").write_text("sealed\n", encoding="utf-8")
+        task_c_analysis._write_sha_manifest(root)  # noqa: SLF001 - construct a production-format receipt
+        roots[condition] = root
+    return roots
+
+
 def test_trace_context_is_condition_independent_and_disjoint() -> None:
     calibration = _context(episode_idx=0)
     evaluation = _context(episode_idx=1)
@@ -156,6 +214,22 @@ def test_significantly_better_candidate_is_not_rejected_by_mcnemar() -> None:
     assert result["validity_gate_pass"] is True
 
 
+def test_decision_stats_count_exact_kappa_reinfers_and_reject_unknown_labels() -> None:
+    calls = [
+        {"decision_eligible": True, "decision": "skip_vlm"},
+        {"decision_eligible": True, "decision": "infer_vlm"},
+    ]
+
+    result = task_c_analysis._decision_stats(calls)  # noqa: SLF001 - verify the analysis contract directly
+
+    assert result["kappa_forced_reinfer_count"] == 1
+    assert result["kappa_ever_forced_reinfer"] is True
+    with pytest.raises(task_c_trace.TaskCTraceError, match="unexpected eligible decision"):
+        task_c_analysis._decision_stats(  # noqa: SLF001 - verify fail-closed receipt analysis
+            [{"decision_eligible": True, "decision": "seed_round"}]
+        )
+
+
 def test_c1_aggregate_rejects_an_incomplete_design(tmp_path: pathlib.Path) -> None:
     roots = {}
     for condition in ("faac_only", "kappa_0p2", "kappa_0p4", "kappa_0p8"):
@@ -173,38 +247,7 @@ def test_c1_aggregate_rejects_an_incomplete_design(tmp_path: pathlib.Path) -> No
 
 
 def test_paired_suite_aggregate_accepts_exact_c3_design(tmp_path: pathlib.Path) -> None:
-    roots: dict[str, pathlib.Path] = {}
-    for condition in ("faac_only", "kappa_0p4"):
-        root = tmp_path / condition
-        episodes: list[dict] = []
-        calls: list[dict] = []
-        steps: list[dict] = []
-        for task_id in range(10):
-            for episode_idx in range(30):
-                context = _context(
-                    episode_idx=episode_idx,
-                    suite="libero_object",
-                    task_id=task_id,
-                )
-                episodes.append({**context, "condition": condition, "success": True})
-                if condition == "kappa_0p4":
-                    calls.append(
-                        {
-                            **context,
-                            "condition": condition,
-                            "decision_eligible": True,
-                            "decision": "skip_vlm",
-                        }
-                    )
-                    steps.append({**context, "condition": condition, "phase": "approach"})
-        _write_jsonl(root / "episodes.jsonl", episodes)
-        _write_jsonl(root / "server_trace" / "wm_calls.jsonl", calls)
-        _write_jsonl(root / "steps_labeled.jsonl", steps)
-        _write_jsonl(root / "mu" / "calibration" / "index.jsonl", [])
-        _write_jsonl(root / "mu" / "eval" / "index.jsonl", [])
-        (root / "summary.json").write_text("{}\n", encoding="utf-8")
-        (root / "SHA256SUMS").write_text("", encoding="utf-8")
-        roots[condition] = root
+    roots = _paired_suite_roots(tmp_path)
 
     result = task_c_analysis.aggregate_paired_suite(
         tmp_path / "aggregate",
@@ -214,8 +257,39 @@ def test_paired_suite_aggregate_accepts_exact_c3_design(tmp_path: pathlib.Path) 
 
     assert result["experiment"] == "C3_libero_object_k9"
     assert result["suite"] == "libero_object"
+    assert result["world_model_training_suite"] == "libero_spatial"
+    assert result["wm_out_of_training_suite"] is True
     assert result["paired"]["kappa_0p4"]["validity_gate_pass"] is True
     assert result["paired"]["kappa_0p4"]["deployable_valid_skip_rate"] == 1.0
+
+
+def test_paired_suite_aggregate_rejects_tampered_condition_receipt(tmp_path: pathlib.Path) -> None:
+    roots = _paired_suite_roots(tmp_path)
+    (roots["kappa_0p4"] / "client.log").write_text("tampered\n", encoding="utf-8")
+
+    with pytest.raises(task_c_trace.TaskCTraceError, match="SHA-256 mismatch"):
+        task_c_analysis.aggregate_paired_suite(
+            tmp_path / "aggregate",
+            roots,
+            suite="libero_object",
+        )
+
+
+def test_paired_suite_aggregate_rejects_non_k9_condition(tmp_path: pathlib.Path) -> None:
+    roots = _paired_suite_roots(tmp_path)
+    root = roots["kappa_0p4"]
+    manifest_path = root / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["trigger_k"] = 8
+    task_c_trace.write_json_atomic(manifest_path, manifest)
+    task_c_analysis._write_sha_manifest(root)  # noqa: SLF001 - reseal an internally consistent invalid receipt
+
+    with pytest.raises(task_c_trace.TaskCTraceError, match="trigger_k"):
+        task_c_analysis.aggregate_paired_suite(
+            tmp_path / "aggregate",
+            roots,
+            suite="libero_object",
+        )
 
 
 def test_paired_suite_aggregate_cli_accepts_c3_inputs(monkeypatch) -> None:
