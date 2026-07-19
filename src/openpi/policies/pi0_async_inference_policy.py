@@ -26,7 +26,7 @@ import openpi.transforms as transforms
 logger = logging.getLogger("openpi")
 
 
-class _LowKappaFullPi0Fallback(Exception):
+class _LowKappaFullPi0Fallback(Exception):  # noqa: N818 - retained released internal exception name
     """WM multi-rollout saw κ_r < κ_0 - kappa_delta at round ``r>=1`` (after WM, before that round's AE).
 
     ``wm_ae_rounds_completed`` counts full WM→AE cycles finished (rounds ``0..r-1``).
@@ -38,11 +38,11 @@ class _LowKappaFullPi0Fallback(Exception):
     """
 
     __slots__ = (
-        "wm_ae_rounds_completed",
-        "kappa_per_round_np",
-        "rollout_len",
-        "rollout_actions_model",
         "glue_actions_model",
+        "kappa_per_round_np",
+        "rollout_actions_model",
+        "rollout_len",
+        "wm_ae_rounds_completed",
     )
 
     def __init__(
@@ -191,7 +191,10 @@ class Pi0AsyncInferencePolicy(_base_policy.BasePolicy):
                 ex.rollout_len,
             )
             stack = np.concatenate(
-                [np.asarray(ex.rollout_actions_model, dtype=np.float32), np.asarray(ex.glue_actions_model, dtype=np.float32)],
+                [
+                    np.asarray(ex.rollout_actions_model, dtype=np.float32),
+                    np.asarray(ex.glue_actions_model, dtype=np.float32),
+                ],
                 axis=0,
             )
             # ``_output_transform`` includes ``Unnormalize(..., strict=True)``, which requires every norm_stats key
@@ -277,13 +280,29 @@ class Pi0AsyncInferencePolicy(_base_policy.BasePolicy):
         host_check_started_ns = time.perf_counter_ns()
         kappa_float = float(np.asarray(jax.device_get(kappa.reshape(()))))
         host_check_done_ns = time.perf_counter_ns()
-        mu_np = np.asarray(jax.device_get(mu), dtype=np.float16)
-        return mu, kappa, {
-            "mu": mu_np,
-            "kappa": kappa_float,
-            "wm_forward_kappa_ms": (forward_done_ns - started_ns) / 1_000_000.0,
-            "kappa_host_check_ms": (host_check_done_ns - host_check_started_ns) / 1_000_000.0,
-        }
+        return (
+            mu,
+            kappa,
+            {
+                "kappa": kappa_float,
+                "wm_forward_kappa_ms": (forward_done_ns - started_ns) / 1_000_000.0,
+                "kappa_host_check_ms": (host_check_done_ns - host_check_started_ns) / 1_000_000.0,
+                "_kappa_decision_started_ns": host_check_done_ns,
+            },
+        )
+
+    @staticmethod
+    def _complete_task_c_wm_measurement(measurement: dict[str, Any] | None, mu: jax.Array) -> None:
+        """Close the tier-0 boundary after the scheduling decision, before trace I/O."""
+
+        if measurement is None:
+            return
+        started_ns = measurement.pop("_kappa_decision_started_ns", None)
+        if started_ns is None or "kappa_decision_ms" in measurement:
+            raise _task_c_trace.TaskCTraceError("Task-C WM measurement boundary was closed more than once")
+        measurement["kappa_decision_ms"] = (time.perf_counter_ns() - int(started_ns)) / 1_000_000.0
+        # Mu persistence is deliberately outside the tier-0 boundary.
+        measurement["mu"] = np.asarray(jax.device_get(mu), dtype=np.float16)
 
     def _record_task_c_wm(
         self,
@@ -308,6 +327,7 @@ class Pi0AsyncInferencePolicy(_base_policy.BasePolicy):
             kappa=measurement["kappa"],
             wm_forward_kappa_ms=measurement["wm_forward_kappa_ms"],
             kappa_host_check_ms=measurement["kappa_host_check_ms"],
+            kappa_decision_ms=measurement["kappa_decision_ms"],
             decision=decision,
             decision_eligible=decision_eligible,
             action_expert_executed=action_expert_executed,
@@ -354,6 +374,7 @@ class Pi0AsyncInferencePolicy(_base_policy.BasePolicy):
         ap_j = jnp.asarray(ap)[jnp.newaxis, ...]
         mask_j = jnp.asarray(prefix_mask)[jnp.newaxis, ...]
         mu, kappa, measurement = self._forward_world_model_task_c(h_t, proprio, ap_j, mask_j, delta, k_wm)
+        self._complete_task_c_wm_measurement(measurement, mu)
 
         ae_src = meta.get("ae_proprio_source")
         if ae_src is not None:
@@ -583,6 +604,7 @@ class Pi0AsyncInferencePolicy(_base_policy.BasePolicy):
                 elif kappa0_f is not None:
                     if low_replan:
                         if k_f < kappa0_f - kappa_th:
+                            self._complete_task_c_wm_measurement(measurement, mu)
                             self._record_task_c_wm(
                                 measurement,
                                 trace_context=trace_context,
@@ -611,6 +633,7 @@ class Pi0AsyncInferencePolicy(_base_policy.BasePolicy):
                                 glue_actions_model=np.asarray(jax.device_get(glue_w), dtype=np.float32),
                             )
                     elif k_f > kappa0_f + kappa_th:
+                        self._complete_task_c_wm_measurement(measurement, mu)
                         self._record_task_c_wm(
                             measurement,
                             trace_context=trace_context,
@@ -623,6 +646,8 @@ class Pi0AsyncInferencePolicy(_base_policy.BasePolicy):
                         early_exec_len = overlap + delta_idx * (r - 1)
                         break
 
+            self._complete_task_c_wm_measurement(measurement, mu)
+
             obs_for_ae = self._observation_for_ae_from_prefix(
                 batched=batched,
                 observation=observation,
@@ -630,21 +655,17 @@ class Pi0AsyncInferencePolicy(_base_policy.BasePolicy):
                 mask_j=mask_j,
                 effective_ae=effective_ae,
             )
-            if self._world_model is not None and _wm_verify.wm_inference_verify_mode() != "off":
-                if adaptive and r == max_r - 1:
-                    _wm_verify.run_wm_inference_verification(
-                        pi0=self._pi0,
-                        world_model=self._world_model,
-                        observation=obs_for_ae,
-                        mu=mu,
-                    )
-                elif not adaptive and r == num_rounds - 1:
-                    _wm_verify.run_wm_inference_verification(
-                        pi0=self._pi0,
-                        world_model=self._world_model,
-                        observation=obs_for_ae,
-                        mu=mu,
-                    )
+            if (
+                self._world_model is not None
+                and _wm_verify.wm_inference_verify_mode() != "off"
+                and ((adaptive and r == max_r - 1) or (not adaptive and r == num_rounds - 1))
+            ):
+                _wm_verify.run_wm_inference_verification(
+                    pi0=self._pi0,
+                    world_model=self._world_model,
+                    observation=obs_for_ae,
+                    mu=mu,
+                )
 
             ae_actions = self._sample_with_future(
                 k_sample,

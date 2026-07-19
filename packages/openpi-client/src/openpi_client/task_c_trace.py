@@ -148,6 +148,15 @@ def sha256_file(path: pathlib.Path) -> str:
     return digest.hexdigest()
 
 
+def write_json_atomic(path: pathlib.Path, value: Any) -> None:
+    """Write canonical JSON without exposing a partially written receipt."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    temporary.write_bytes(canonical_json_bytes(value) + b"\n")
+    os.replace(temporary, path)
+
+
 def _append_bytes(path: pathlib.Path, payload: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
@@ -268,6 +277,7 @@ class ServerTraceRecorder:
         kappa: float,
         wm_forward_kappa_ms: float,
         kappa_host_check_ms: float,
+        kappa_decision_ms: float,
         decision: str,
         decision_eligible: bool,
         action_expert_executed: bool,
@@ -291,6 +301,8 @@ class ServerTraceRecorder:
             raise TaskCTraceError("wm_forward_kappa_ms must be finite and > 0")
         if not math.isfinite(float(kappa_host_check_ms)) or kappa_host_check_ms < 0:
             raise TaskCTraceError("kappa_host_check_ms must be finite and >= 0")
+        if not math.isfinite(float(kappa_decision_ms)) or kappa_decision_ms < 0:
+            raise TaskCTraceError("kappa_decision_ms must be finite and >= 0")
 
         mu_array = np.asarray(mu)
         if mu_array.shape == (1, *MU_SHAPE):
@@ -325,7 +337,7 @@ class ServerTraceRecorder:
                 **ctx,
             }
             append_jsonl(self.root / "mu_raw" / "index.jsonl", mu_index)
-            c_tier0_ms = float(wm_forward_kappa_ms) + float(kappa_host_check_ms)
+            c_tier0_ms = float(wm_forward_kappa_ms) + float(kappa_host_check_ms) + float(kappa_decision_ms)
             append_jsonl(
                 self.root / "wm_calls.jsonl",
                 {
@@ -340,6 +352,7 @@ class ServerTraceRecorder:
                     "action_expert_executed": bool(action_expert_executed),
                     "wm_forward_kappa_ms": float(wm_forward_kappa_ms),
                     "kappa_host_check_ms": float(kappa_host_check_ms),
+                    "kappa_decision_ms": float(kappa_decision_ms),
                     "c_tier0_ms": c_tier0_ms,
                     "timing_warmup": wm_idx < self.timing_warmup_calls,
                     "mu_sha256": mu_sha,

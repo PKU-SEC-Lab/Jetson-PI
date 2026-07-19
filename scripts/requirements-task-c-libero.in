@@ -1,0 +1,24 @@
+# Python 3.11-compatible LIBERO client stack for Task-C.  The upstream
+# examples/libero lock targets Python 3.8 and CUDA-enabled torch 1.11, so it
+# cannot be reused for this isolated H100 policy-server / CPU simulator-client
+# split.  Compile this file with the command recorded in the generated lock.
+bddl==1.0.1
+cloudpickle==2.1.0
+dm-tree==0.1.9
+easydict==1.9
+future==0.18.2
+gym==0.25.2
+imageio[ffmpeg]==2.37.0
+matplotlib==3.5.3
+msgpack==1.1.1
+mujoco==2.3.2
+numpy==1.26.4
+opencv-python==4.6.0.66
+pillow==11.3.0
+pyyaml==6.0.2
+robosuite==1.4.1
+torch==2.5.1+cpu
+tqdm==4.67.1
+tree==0.2.4
+tyro==0.9.26
+websockets==15.0.1

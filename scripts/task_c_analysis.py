@@ -17,13 +17,6 @@ MU_ROWS_PER_SHARD = 4096
 NONINFERIORITY_MARGIN = -0.05
 
 
-def _write_json(path: pathlib.Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    temporary.write_bytes(task_c_trace.canonical_json_bytes(value) + b"\n")
-    os.replace(temporary, path)
-
-
 def _write_jsonl(path: pathlib.Path, records: Iterable[Mapping[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
@@ -278,12 +271,12 @@ def finalize_condition(output_root: pathlib.Path) -> dict[str, Any]:
         "c_tier0_warmup_calls_discarded": sum(bool(call["timing_warmup"]) for call in wm_calls),
         "mu": mu_receipt,
     }
-    _write_json(output_root / "summary.json", summary)
+    task_c_trace.write_json_atomic(output_root / "summary.json", summary)
     manifest["status"] = "complete"
     manifest["actual_episodes"] = len(episodes)
     manifest["summary_sha256"] = task_c_trace.sha256_file(output_root / "summary.json")
     manifest["steps_labeled_sha256"] = task_c_trace.sha256_file(output_root / "steps_labeled.jsonl")
-    _write_json(manifest_path, manifest)
+    task_c_trace.write_json_atomic(manifest_path, manifest)
     sha_path, sha = _write_sha_manifest(output_root)
     # A manifest cannot contain its own digest without a circular dependency.
     # Return the out-of-band digest to the caller, but keep the persisted files
@@ -340,9 +333,11 @@ def _paired_result(
         cand_success,
         seed=bootstrap_seed,
     )
+    success_rate_delta = float(bootstrap["success_rate_delta"])
     mcnemar_nonsignificant = float(mcnemar["p_value_two_sided_exact"]) >= 0.05
+    mcnemar_no_evidence_of_harm = mcnemar_nonsignificant or success_rate_delta >= 0.0
     noninferior = float(bootstrap["lower_95_one_sided"]) >= NONINFERIORITY_MARGIN
-    validity = mcnemar_nonsignificant and noninferior
+    validity = mcnemar_no_evidence_of_harm and noninferior
     preserved = {key for key in trajectory_ids if bool(base_by_id[key]["success"]) and bool(cand_by_id[key]["success"])}
     raw = _decision_stats(calls)
     success_conditioned = _decision_stats(calls, preserved_trajectories=preserved)
@@ -370,6 +365,7 @@ def _paired_result(
         "paired_bootstrap": bootstrap,
         "noninferiority_margin": NONINFERIORITY_MARGIN,
         "mcnemar_nonsignificant": mcnemar_nonsignificant,
+        "mcnemar_no_evidence_of_harm": mcnemar_no_evidence_of_harm,
         "noninferior": noninferior,
         "validity_gate_pass": validity,
         "preserved_success_pairs": len(preserved),
@@ -394,6 +390,30 @@ def aggregate_c1(c1_root: pathlib.Path, condition_roots: Mapping[str, pathlib.Pa
     c1_root = c1_root.resolve()
     c1_root.mkdir(parents=True, exist_ok=True)
     baseline = task_c_trace.read_jsonl(condition_roots["faac_only"] / "episodes.jsonl")
+
+    expected_tasks = set(range(10))
+    expected_trajectory_ids: set[str] | None = None
+    for condition, root in sorted(condition_roots.items()):
+        episodes = task_c_trace.read_jsonl(root / "episodes.jsonl")
+        if len(episodes) != 300:
+            raise task_c_trace.TaskCTraceError(f"C1 {condition} must contain exactly 300 episodes, got {len(episodes)}")
+        task_ids = {int(item["task_id"]) for item in episodes}
+        if task_ids != expected_tasks:
+            raise task_c_trace.TaskCTraceError(f"C1 {condition} task ids {sorted(task_ids)} != 0..9")
+        if any(str(item["suite"]) != "libero_spatial" or int(item["seed"]) != 42 for item in episodes):
+            raise task_c_trace.TaskCTraceError(f"C1 {condition} must use libero_spatial and seed 42")
+        for task_id in sorted(expected_tasks):
+            task_episodes = [item for item in episodes if int(item["task_id"]) == task_id]
+            episode_indices = {int(item["episode_idx"]) for item in task_episodes}
+            if len(task_episodes) != 30 or episode_indices != set(range(30)):
+                raise task_c_trace.TaskCTraceError(
+                    f"C1 {condition} task {task_id} must contain episode_idx 0..29 exactly once"
+                )
+        trajectory_ids = {str(item["trajectory_id"]) for item in episodes}
+        if expected_trajectory_ids is None:
+            expected_trajectory_ids = trajectory_ids
+        elif trajectory_ids != expected_trajectory_ids:
+            raise task_c_trace.TaskCTraceError(f"C1 {condition} is not paired to the baseline trajectory set")
     condition_summaries: dict[str, Any] = {}
     paired: dict[str, Any] = {}
     all_mu_indexes: list[dict[str, Any]] = []
@@ -459,7 +479,7 @@ def aggregate_c1(c1_root: pathlib.Path, condition_roots: Mapping[str, pathlib.Pa
         "unique_eval_trajectories": sum(value == "eval" for value in split_by_trajectory.values()),
         "shards": mu_shards,
     }
-    _write_json(c1_root / "mu_shards.json", mu_manifest)
+    task_c_trace.write_json_atomic(c1_root / "mu_shards.json", mu_manifest)
     summary = {
         "schema_version": task_c_trace.SCHEMA_VERSION,
         "experiment": "C1_libero_spatial_k9",
@@ -468,7 +488,7 @@ def aggregate_c1(c1_root: pathlib.Path, condition_roots: Mapping[str, pathlib.Pa
         "mu_shards_manifest": "mu_shards.json",
         "mu_shards_manifest_sha256": task_c_trace.sha256_file(c1_root / "mu_shards.json"),
     }
-    _write_json(c1_root / "summary.json", summary)
+    task_c_trace.write_json_atomic(c1_root / "summary.json", summary)
     run_manifest = {
         "schema_version": task_c_trace.SCHEMA_VERSION,
         "experiment": "C1_libero_spatial_k9",
@@ -483,7 +503,7 @@ def aggregate_c1(c1_root: pathlib.Path, condition_roots: Mapping[str, pathlib.Pa
         "summary_sha256": task_c_trace.sha256_file(c1_root / "summary.json"),
         "mu_shards_manifest_sha256": task_c_trace.sha256_file(c1_root / "mu_shards.json"),
     }
-    _write_json(c1_root / "run_manifest.json", run_manifest)
+    task_c_trace.write_json_atomic(c1_root / "run_manifest.json", run_manifest)
     _, manifest_sha = _write_sha_manifest(c1_root)
     return {**summary, "receipt_manifest_sha256": manifest_sha}
 

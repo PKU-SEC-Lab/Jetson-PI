@@ -50,6 +50,7 @@ def test_server_trace_rejects_wrong_mu_shape(tmp_path: pathlib.Path) -> None:
             kappa=1.0,
             wm_forward_kappa_ms=1.0,
             kappa_host_check_ms=0.01,
+            kappa_decision_ms=0.001,
             decision="seed_round",
             decision_eligible=False,
             action_expert_executed=True,
@@ -124,6 +125,47 @@ def test_valid_skip_rate_requires_preserved_paired_success() -> None:
     assert result["per_phase"]["contact"]["deployable_valid_skip_rate"] == 1.0
 
 
+def test_significantly_better_candidate_is_not_rejected_by_mcnemar() -> None:
+    baseline = []
+    candidate = []
+    calls = []
+    phase_map = {}
+    for episode_idx in range(30):
+        context = _context(episode_idx=episode_idx)
+        baseline.append({**context, "success": episode_idx < 20})
+        candidate.append({**context, "success": True})
+        phase_map[(context["trajectory_id"], 0)] = "approach"
+        calls.append({**context, "decision_eligible": True, "decision": "skip_vlm"})
+
+    result = task_c_analysis._paired_result(  # noqa: SLF001 - verify the analysis contract directly
+        baseline,
+        candidate,
+        calls,
+        phase_map,
+        bootstrap_seed=42,
+    )
+
+    assert result["mcnemar_nonsignificant"] is False
+    assert result["mcnemar_no_evidence_of_harm"] is True
+    assert result["validity_gate_pass"] is True
+
+
+def test_c1_aggregate_rejects_an_incomplete_design(tmp_path: pathlib.Path) -> None:
+    roots = {}
+    for condition in ("faac_only", "kappa_0p2", "kappa_0p4", "kappa_0p8"):
+        root = tmp_path / condition
+        root.mkdir()
+        context = _context(episode_idx=0)
+        (root / "episodes.jsonl").write_text(
+            task_c_trace.canonical_json_bytes({**context, "condition": condition, "success": True}).decode() + "\n",
+            encoding="utf-8",
+        )
+        roots[condition] = root
+
+    with pytest.raises(task_c_trace.TaskCTraceError, match="exactly 300 episodes"):
+        task_c_analysis.aggregate_c1(tmp_path / "aggregate", roots)
+
+
 def test_finalize_condition_emits_required_schema(tmp_path: pathlib.Path) -> None:
     manifest = {
         "schema_version": task_c_trace.SCHEMA_VERSION,
@@ -166,6 +208,7 @@ def test_finalize_condition_emits_required_schema(tmp_path: pathlib.Path) -> Non
             kappa=1.0,
             wm_forward_kappa_ms=1.0,
             kappa_host_check_ms=0.01,
+            kappa_decision_ms=0.001,
             decision="seed_round",
             decision_eligible=False,
             action_expert_executed=True,
@@ -178,6 +221,7 @@ def test_finalize_condition_emits_required_schema(tmp_path: pathlib.Path) -> Non
             kappa=0.9,
             wm_forward_kappa_ms=1.1,
             kappa_host_check_ms=0.02,
+            kappa_decision_ms=0.002,
             decision="skip_vlm",
             decision_eligible=True,
             action_expert_executed=True,

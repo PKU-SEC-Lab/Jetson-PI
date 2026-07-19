@@ -1,10 +1,11 @@
+from collections.abc import Callable
 import dataclasses
 import json
 import logging
 import math
 import pathlib
 import sys
-from typing import Callable, Dict, Literal, Optional
+from typing import Literal
 
 import imageio
 from libero.libero import benchmark
@@ -26,8 +27,8 @@ OPENPI_ASYNC_KEY = "openpi/async"
 def _wm_multi_stitch_seed_and_prev_tail(
     prev_full: np.ndarray,
     *,
-    H: int,
-    O: int,
+    H: int,  # noqa: N803 - mathematical horizon notation used throughout this released scheduler
+    O: int,  # noqa: E741,N803 - mathematical overlap notation used throughout this released scheduler
     delta_idx: int,
     stitch_n: int | None,
     default_n: int,
@@ -61,9 +62,8 @@ def _wm_multi_stitch_seed_and_prev_tail(
 def _mean_int(xs: list[int]) -> float:
     return float(sum(xs) / len(xs)) if xs else float("nan")
 
-_LIBERO_HANDOVER_MODES = frozenset(
-    {"handover_true", "handover_vlash_last_action", "handover_future_rollout"}
-)
+
+_LIBERO_HANDOVER_MODES = frozenset({"handover_true", "handover_vlash_last_action", "handover_future_rollout"})
 
 
 def _make_libero_handover_norm_proxy_fn(
@@ -73,7 +73,7 @@ def _make_libero_handover_norm_proxy_fn(
     ex = pathlib.Path(__file__).resolve().parent
     if str(ex) not in sys.path:
         sys.path.insert(0, str(ex))
-    import libero_handover_proprio as lhp  # noqa: PLC0415
+    import libero_handover_proprio as lhp
 
     st_s, ac_s = lhp.load_pi0_libero_norm_stats(checkpoint_parent)
 
@@ -101,16 +101,15 @@ def _pack_libero_proprio_vector(obs: dict) -> np.ndarray:
 
 
 class _WmAeInferRoundStatsLogger:
-
     __slots__ = (
+        "_kappa_drop_edge_den",
+        "_kappa_drop_edge_num",
+        "_n_exception_fallback",
+        "_n_infers_kappa_vec",
         "_n_infers_wm",
+        "_n_low_replan_fallback",
         "_rounds_sum",
         "_sum_infer_mean_kappa",
-        "_n_infers_kappa_vec",
-        "_kappa_drop_edge_num",
-        "_kappa_drop_edge_den",
-        "_n_low_replan_fallback",
-        "_n_exception_fallback",
     )
 
     def __init__(self) -> None:
@@ -137,11 +136,7 @@ class _WmAeInferRoundStatsLogger:
             self._n_exception_fallback += 1
 
         partial_raw = full.get("openpi/wm_low_replan_partial_wm_ae_rounds")
-        partial_wm_ae: int | None
-        if partial_raw is None:
-            partial_wm_ae = None
-        else:
-            partial_wm_ae = int(np.asarray(partial_raw, dtype=np.int64).reshape(()))
+        partial_wm_ae = None if partial_raw is None else int(np.asarray(partial_raw, dtype=np.int64).reshape(()))
 
         if sn is not None:
             self._rounds_sum += int(sn)
@@ -217,7 +212,7 @@ def _libero_oracle_handover_prefetch_hook(env_holder: dict):
         if env is None:
             raise RuntimeError("oracle_handover prefetch: env_holder['env'] not set")
         out = dict(obs)
-        K, H = int(ctx.async_trigger_step), int(ctx.action_horizon)
+        K, H = int(ctx.async_trigger_step), int(ctx.action_horizon)  # noqa: N806 - published K/H notation
         ap = np.asarray(ctx.chunk_actions[K:H], dtype=np.float32)
         saved = env.get_sim_state()
         rob_obs = None
@@ -230,18 +225,17 @@ def _libero_oracle_handover_prefetch_hook(env_holder: dict):
         finally:
             env.set_state(saved)
             env.env.sim.forward()
-            env._post_process()
-            env._update_observables(force=True)
+            env._post_process()  # noqa: SLF001 - robosuite exposes no public equivalent after state restore
+            env._update_observables(force=True)  # noqa: SLF001 - same state-restore boundary
         return out
 
     return hook
 
 
-def _libero_wm_prefetch_hook(async_key: str, *, ae_proprio_source: Optional[str] = None):
-
+def _libero_wm_prefetch_hook(async_key: str, *, ae_proprio_source: str | None = None):
     def hook(obs: dict, ctx: action_chunk_broker.PrefetchContext) -> dict:
         out = dict(obs)
-        K, H = int(ctx.async_trigger_step), int(ctx.action_horizon)
+        K, H = int(ctx.async_trigger_step), int(ctx.action_horizon)  # noqa: N806 - published K/H notation
         ap = np.asarray(ctx.chunk_actions[K:H], dtype=np.float32)
         if ap.shape[0] == 0:
             raise RuntimeError(
@@ -267,13 +261,12 @@ def _libero_wm_multi_rollout_prefetch_hook(
     *,
     num_rounds: int,
     wm_rollout_delta_t: float,
-    ae_proprio_source: Optional[str] = None,
+    ae_proprio_source: str | None = None,
 ):
-
     def hook(obs: dict, ctx: action_chunk_broker.PrefetchContext) -> dict:
         out = dict(obs)
-        H = int(ctx.action_horizon)
-        O = int(ctx.overlap_skip)
+        H = int(ctx.action_horizon)  # noqa: N806 - published horizon notation
+        O = int(ctx.overlap_skip)  # noqa: E741,N806 - published overlap notation
         delta_idx = int(round(float(wm_rollout_delta_t)))
         if O + (num_rounds - 1) * delta_idx > H:
             raise ValueError(
@@ -288,9 +281,7 @@ def _libero_wm_multi_rollout_prefetch_hook(
             )
         seed = np.asarray(ctx.chunk_actions, dtype=np.float32)
         if int(seed.shape[0]) != H:
-            raise ValueError(
-                f"wm_multi_rollout prefetch: chunk_actions must have length H={H}, got {seed.shape[0]}"
-            )
+            raise ValueError(f"wm_multi_rollout prefetch: chunk_actions must have length H={H}, got {seed.shape[0]}")
         eff_ae = "prefix_t" if ae_proprio_source is None else ae_proprio_source
         wm_seed, prev_tail = _wm_multi_stitch_seed_and_prev_tail(
             seed,
@@ -324,16 +315,15 @@ def _libero_wm_multi_rollout_adaptive_prefetch_hook(
     *,
     wm_rollout_delta_t: float,
     kappa_delta: float,
-    ae_proprio_source: Optional[str] = None,
+    ae_proprio_source: str | None = None,
     adaptive_kappa_low_replan: bool = False,
 ):
-
     def hook(obs: dict, ctx: action_chunk_broker.PrefetchContext) -> dict:
         from openpi.policies.wm_multi_rollout_schedule import wm_multi_rollout_adaptive_max_rounds
 
         out = dict(obs)
-        H = int(ctx.action_horizon)
-        O = int(ctx.overlap_skip)
+        H = int(ctx.action_horizon)  # noqa: N806 - published horizon notation
+        O = int(ctx.overlap_skip)  # noqa: E741,N806 - published overlap notation
         delta_idx = int(round(float(wm_rollout_delta_t)))
         max_r = wm_multi_rollout_adaptive_max_rounds(h=H, overlap=O, delta_idx=delta_idx)
         if O + (max_r - 1) * delta_idx > H:
@@ -348,9 +338,7 @@ def _libero_wm_multi_rollout_adaptive_prefetch_hook(
             )
         seed = np.asarray(ctx.chunk_actions, dtype=np.float32)
         if int(seed.shape[0]) != H:
-            raise ValueError(
-                f"wm_multi_rollout prefetch: chunk_actions must have length H={H}, got {seed.shape[0]}"
-            )
+            raise ValueError(f"wm_multi_rollout prefetch: chunk_actions must have length H={H}, got {seed.shape[0]}")
         eff_ae = "prefix_t" if ae_proprio_source is None else ae_proprio_source
         wm_seed, prev_tail = _wm_multi_stitch_seed_and_prev_tail(
             seed,
@@ -389,7 +377,6 @@ def _make_wm_low_replan_two_phase_fn(
     args,  # tyro Args (``Args``); defined below to avoid forward-ref issues
     openpi_async_key: str,
 ) -> Callable[[dict, dict], dict]:
-
     def low_replan_two_phase(_obs_snap: dict, p1: dict) -> dict:
         if not bool(p1.get("openpi/wm_low_replan_two_phase")):
             return p1
@@ -401,11 +388,9 @@ def _make_wm_low_replan_two_phase_fn(
         glue = np.asarray(p1["openpi/wm_low_replan_glue_actions"], dtype=np.float32)
         n_roll = int(np.asarray(p1["openpi/wm_low_replan_rollout_len"], dtype=np.int64).reshape(()))
         if int(roll.shape[0]) != n_roll:
-            raise RuntimeError(
-                f"wm low_replan_two_phase: rollout_len={n_roll} vs roll.shape[0]={roll.shape[0]}"
-            )
-        H = int(args.action_horizon)
-        O = int(args.overlap_skip)
+            raise RuntimeError(f"wm low_replan_two_phase: rollout_len={n_roll} vs roll.shape[0]={roll.shape[0]}")
+        H = int(args.action_horizon)  # noqa: N806 - published horizon notation
+        O = int(args.overlap_skip)  # noqa: E741,N806 - published overlap notation
         if int(glue.shape[0]) != O:
             raise RuntimeError(f"wm low_replan_two_phase: glue rows {glue.shape[0]} != overlap_skip={O}")
         obs = None
@@ -483,7 +468,7 @@ def _validate_async_chunk_params(
     action_horizon: int,
     overlap_skip: int,
     async_trigger_step: int,
-    chunk_exec_steps: Optional[int] = None,
+    chunk_exec_steps: int | None = None,
     allow_trigger_at_chunk_start: bool = False,
 ) -> None:
     if not (0 <= overlap_skip < action_horizon):
@@ -522,7 +507,7 @@ class Args:
     async_trigger_step: int = 3
     overlap_skip: int = 0
     async_use_world_model: bool = False
-    async_chunk_exec_steps: Optional[int] = None
+    async_chunk_exec_steps: int | None = None
     async_allow_trigger_at_chunk_start: bool = False
     async_prefetch_proprio: Literal[
         "trigger",
@@ -532,7 +517,7 @@ class Args:
         "handover_future_rollout",
     ] = "trigger"
     pi0_norm_checkpoint_dir: str = "PATH/TO/CHECKPOINT/pi05_libero"
-    async_proprio_state_chunk_index: Optional[int] = None
+    async_proprio_state_chunk_index: int | None = None
     async_use_proprio_state_at_h_minus_k: bool = False
     async_wm_multi_rollout: bool = False
     async_wm_multi_rollout_num_rounds: int = 3
@@ -544,14 +529,14 @@ class Args:
     num_steps_wait: int = 10
     num_trials_per_task: int = 50
     video_out_path: str = "data/libero/videos"
-    wm_confidence_jsonl: Optional[str] = None
+    wm_confidence_jsonl: str | None = None
     seed: int = 7
     task_id_start: int = 0
-    task_id_count: Optional[int] = None
+    task_id_count: int | None = None
     write_videos: bool = True
-    task_c_trace_dir: Optional[str] = None
-    task_c_run_id: Optional[str] = None
-    task_c_condition: Optional[str] = None
+    task_c_trace_dir: str | None = None
+    task_c_run_id: str | None = None
+    task_c_condition: str | None = None
 
 
 def eval_libero(args: Args) -> None:
@@ -705,7 +690,7 @@ def eval_libero(args: Args) -> None:
                 f"({sorted(_LIBERO_HANDOVER_MODES)}); non-handover async uses AsyncActionBufferBroker, which "
                 "executes one policy action per env step from a rolling buffer (pass async_chunk_exec_steps=None)."
             )
-        handover_merged_state_fn: Optional[Callable[[Dict, Dict, np.ndarray], np.ndarray]] = None
+        handover_merged_state_fn: Callable[[dict, dict, np.ndarray], np.ndarray] | None = None
         if args.async_prefetch_proprio == "handover_vlash_last_action":
             handover_merged_state_fn = _make_libero_handover_norm_proxy_fn(
                 pathlib.Path(args.pi0_norm_checkpoint_dir), "vlash_last_action"
@@ -715,7 +700,7 @@ def eval_libero(args: Args) -> None:
                 pathlib.Path(args.pi0_norm_checkpoint_dir), "future_rollout"
             )
 
-        handover_snapshot_hook: Optional[Callable[[Dict, action_chunk_broker.PrefetchContext], Dict]] = None
+        handover_snapshot_hook: Callable[[dict, action_chunk_broker.PrefetchContext], dict] | None = None
         if args.async_use_world_model and args.async_wm_multi_rollout and args.async_wm_multi_rollout_adaptive_kappa:
             prefetch_hook = _libero_wm_multi_rollout_adaptive_prefetch_hook(
                 OPENPI_ASYNC_KEY,
@@ -820,7 +805,9 @@ def eval_libero(args: Args) -> None:
 
                         img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
                         wrist_img = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
-                        img = image_tools.convert_to_uint8(image_tools.resize_with_pad(img, args.resize_size, args.resize_size))
+                        img = image_tools.convert_to_uint8(
+                            image_tools.resize_with_pad(img, args.resize_size, args.resize_size)
+                        )
                         wrist_img = image_tools.convert_to_uint8(
                             image_tools.resize_with_pad(wrist_img, args.resize_size, args.resize_size)
                         )
@@ -948,9 +935,7 @@ def eval_libero(args: Args) -> None:
                         "overlap_skip": int(args.overlap_skip),
                         "async_wm_rollout_delta_t": float(args.async_wm_rollout_delta_t),
                         "async_wm_multi_rollout": bool(args.async_wm_multi_rollout),
-                        "async_wm_multi_rollout_adaptive_kappa": bool(
-                            args.async_wm_multi_rollout_adaptive_kappa
-                        ),
+                        "async_wm_multi_rollout_adaptive_kappa": bool(args.async_wm_multi_rollout_adaptive_kappa),
                         "async_wm_multi_rollout_kappa_delta": float(args.async_wm_multi_rollout_kappa_delta),
                         "async_wm_multi_rollout_adaptive_kappa_low_replan": bool(
                             args.async_wm_multi_rollout_adaptive_kappa_low_replan
@@ -1011,7 +996,7 @@ def eval_libero(args: Args) -> None:
     finally:
         if isinstance(
             chunk_policy,
-            (action_chunk_broker.AsyncActionChunkBroker, action_chunk_broker.AsyncActionBufferBroker),
+            action_chunk_broker.AsyncActionChunkBroker | action_chunk_broker.AsyncActionBufferBroker,
         ):
             chunk_policy.shutdown()
 

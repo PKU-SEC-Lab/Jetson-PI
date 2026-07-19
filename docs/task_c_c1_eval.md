@@ -16,6 +16,13 @@ PYTHONPATH=packages/openpi-client/src:src:. "$PY" -m scripts.task_c_c1 checkpoin
 PYTHONPATH=packages/openpi-client/src:src:. "$PY" -m scripts.task_c_c1 preflight
 ```
 
+The policy environment is resolved by the repository `uv.lock`. The simulator
+client uses `scripts/requirements-task-c-libero.txt`, compiled from the adjacent
+`.in` file for Python 3.11 with the PyTorch CPU wheel index. This is intentional:
+the upstream LIBERO example lock is Python-3.8-era and cannot resolve in the
+approved Python 3.11 environment. Each run also records both environment freezes
+and the client-lock SHA-256.
+
 The checkpoint checkout must be detached at
 `a3a803da176b10ab87dc5e29720d47c772848b43`. The manifest command hashes every
 file and checks each LFS object against both its Git LFS OID and the pinned
@@ -51,7 +58,7 @@ PYTHONPATH=packages/openpi-client/src:src:. "$ROOT/envs/policy/bin/python" \
 
 `c_tier0_ms` covers the jitted 40M world-model call, including the learned
 4×1024 reducer and the device-side `-mean(log_var)` calculation, plus host
-materialization of kappa. It excludes VLM, action expert, simulator, websocket,
+materialization of kappa and the actual confidence-threshold comparison. It excludes VLM, action expert, simulator, websocket,
 mu copying, and trace I/O. The first 30 WM calls are marked warmup and excluded
 from timing percentiles.
 
@@ -73,5 +80,21 @@ The raw end-effector delta and gripper qpos are retained on every control step.
 The aggregate reports exact paired McNemar tests and a deterministic paired
 bootstrap confidence interval for candidate-minus-baseline success rate. A skip
 rate is deployable only when McNemar is non-significant at 0.05 and the one-sided
-95% lower bound is at least -5 percentage points. Raw, success-conditioned, and
+95% lower bound is at least -5 percentage points. A statistically significant
+improvement is also accepted; McNemar significance is never treated as harm by
+itself. Raw, success-conditioned, and
 deployable-valid skip rates remain separate fields.
+
+The C1 aggregator fails closed unless all four conditions contain exactly the
+same 300 trajectories: tasks 0–9, initialization indices 0–29, and seed 42.
+This prevents a smoke or partial block from being labeled as the completed
+1,200-episode experiment.
+
+## Gated follow-on: RAPID comparator
+
+After C1 and only with a separate gate, add a training-free O(1) proprio trigger
+using end-effector translation/rotation velocity and gripper-state transitions.
+Run it on the identical task/seed trajectories and report the same success,
+noninferiority, raw/valid-skip, and approach/contact schema. Keep its trigger
+cost separate from `c_tier0_ms`; this A/B determines whether the learned 40M WM
+earns its additional compute over a kinematic heuristic.

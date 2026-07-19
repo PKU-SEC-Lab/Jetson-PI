@@ -18,26 +18,12 @@ TRANSFORMERS_DIR="$("${POLICY_ENV}/bin/python" -c 'import pathlib, transformers;
 cp -r "${REPO}/src/openpi/models_pytorch/transformers_replace/." "${TRANSFORMERS_DIR}/"
 
 uv venv --python 3.11 "${LIBERO_ENV}"
-uv pip install --python "${LIBERO_ENV}/bin/python" \
-  'numpy==1.26.4' \
-  'imageio[ffmpeg]==2.37.0' \
-  'opencv-python==4.6.0.66' \
-  'pillow>=10,<12' \
-  'tqdm>=4.67,<5' \
-  'tyro>=0.9,<1' \
-  'pyyaml>=6,<7' \
-  'easydict==1.9' \
-  'bddl==1.0.1' \
-  'cloudpickle==2.1.0' \
-  'future==0.18.2' \
-  'gym==0.25.2' \
-  'matplotlib==3.5.3' \
-  'mujoco==2.3.2' \
-  'robosuite==1.4.1'
-uv pip install --python "${LIBERO_ENV}/bin/python" \
+uv pip sync --python "${LIBERO_ENV}/bin/python" \
   --index-url https://download.pytorch.org/whl/cpu \
-  'torch==2.5.1'
-uv pip install --python "${LIBERO_ENV}/bin/python" -e "${REPO}/packages/openpi-client"
+  --extra-index-url https://pypi.org/simple \
+  --index-strategy unsafe-best-match \
+  "${REPO}/scripts/requirements-task-c-libero.txt"
+uv pip install --python "${LIBERO_ENV}/bin/python" --no-deps -e "${REPO}/packages/openpi-client"
 uv pip install --python "${LIBERO_ENV}/bin/python" --no-deps -e "${REPO}/third_party/libero" \
   --config-settings editable_mode=compat
 

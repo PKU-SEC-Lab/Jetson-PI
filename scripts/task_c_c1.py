@@ -54,13 +54,6 @@ def _run(
     )
 
 
-def _write_json(path: pathlib.Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    temporary.write_bytes(task_c_trace.canonical_json_bytes(value) + b"\n")
-    os.replace(temporary, path)
-
-
 def _repo_root() -> pathlib.Path:
     return pathlib.Path(__file__).resolve().parents[1]
 
@@ -81,7 +74,7 @@ def checkpoint_manifest(checkpoint: pathlib.Path, artifact_root: pathlib.Path) -
     if not api_payload.get("Success") or int(api_payload.get("Code", 0)) != 200:
         raise task_c_trace.TaskCTraceError(f"ModelScope file API failed: {api_payload}")
     api_path = artifact_root / "provenance" / "modelscope_files_api.json"
-    _write_json(api_path, api_payload)
+    task_c_trace.write_json_atomic(api_path, api_payload)
     api_files = {str(item["Path"]): item for item in api_payload["Data"]["Files"] if item.get("Type") != "tree"}
 
     lfs_output = _run(["git", "lfs", "ls-files", "--long"], cwd=checkpoint).stdout
@@ -134,7 +127,7 @@ def checkpoint_manifest(checkpoint: pathlib.Path, artifact_root: pathlib.Path) -
         "files": file_receipts,
     }
     manifest_path = artifact_root / "provenance" / "checkpoint_manifest.json"
-    _write_json(manifest_path, manifest)
+    task_c_trace.write_json_atomic(manifest_path, manifest)
     sums = artifact_root / "provenance" / "CHECKPOINT_SHA256SUMS"
     sums.write_text(
         "".join(f"{item['sha256']}  {item['path']}\n" for item in file_receipts),
@@ -149,6 +142,43 @@ def checkpoint_manifest(checkpoint: pathlib.Path, artifact_root: pathlib.Path) -
     }
     print(json.dumps(result, sort_keys=True))
     return result
+
+
+def verify_checkpoint_manifest(checkpoint: pathlib.Path, manifest_path: pathlib.Path) -> dict[str, Any]:
+    """Re-hash the pinned snapshot before every model-bearing operation."""
+
+    checkpoint = checkpoint.resolve()
+    manifest_path = manifest_path.resolve()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("model_id") != MODEL_ID or manifest.get("resolved_snapshot_revision") != MODEL_REVISION:
+        raise task_c_trace.TaskCTraceError("checkpoint manifest model identity or revision is not the pinned target")
+    head = _run(["git", "rev-parse", "HEAD"], cwd=checkpoint).stdout.strip()
+    if head != MODEL_REVISION:
+        raise task_c_trace.TaskCTraceError(f"checkpoint revision {head} != pinned {MODEL_REVISION}")
+    expected = {str(item["path"]): item for item in manifest["files"]}
+    actual = {path.relative_to(checkpoint).as_posix(): path for path in _checkpoint_files(checkpoint)}
+    if set(actual) != set(expected):
+        raise task_c_trace.TaskCTraceError(
+            f"checkpoint file set changed: missing={sorted(set(expected) - set(actual))}, "
+            f"extra={sorted(set(actual) - set(expected))}"
+        )
+    verified_bytes = 0
+    for relative, path in actual.items():
+        receipt = expected[relative]
+        size = path.stat().st_size
+        if size != int(receipt["size"]):
+            raise task_c_trace.TaskCTraceError(f"checkpoint size changed for {relative}")
+        sha = task_c_trace.sha256_file(path)
+        if sha != str(receipt["sha256"]):
+            raise task_c_trace.TaskCTraceError(f"checkpoint SHA-256 changed for {relative}: {sha}")
+        verified_bytes += size
+    return {
+        "manifest": str(manifest_path),
+        "manifest_sha256": task_c_trace.sha256_file(manifest_path),
+        "revision": head,
+        "verified_files": len(actual),
+        "verified_bytes": verified_bytes,
+    }
 
 
 def _base_env(repo: pathlib.Path) -> dict[str, str]:
@@ -169,11 +199,13 @@ def preflight(
     policy_python: pathlib.Path,
     checkpoint: pathlib.Path,
     wm_checkpoint: pathlib.Path,
+    checkpoint_manifest_path: pathlib.Path,
     output: pathlib.Path,
     cuda_device: str,
 ) -> dict[str, Any]:
     output = output.resolve()
     output.mkdir(parents=True, exist_ok=True)
+    checkpoint_verification = verify_checkpoint_manifest(checkpoint.parent, checkpoint_manifest_path)
     preflight_script = """
 import json
 import jax
@@ -213,6 +245,7 @@ print(json.dumps({
     "jax_version": jax.__version__,
     "backend": jax.default_backend(),
     "devices": [str(device) for device in jax.devices()],
+    "device_kinds": [device.device_kind for device in jax.devices()],
     "policy_action_dim": policy._pi0.action_dim,
     "policy_action_horizon": policy._pi0.action_horizon,
     "mu_shape": list(mu_np.shape),
@@ -238,7 +271,12 @@ print(json.dumps({
     receipt = json.loads(json_lines[-1])
     if receipt["backend"] != "gpu":
         raise task_c_trace.TaskCTraceError(f"preflight backend is not GPU: {receipt['backend']}")
-    _write_json(output / "preflight.json", receipt)
+    if receipt["jax_version"] != "0.5.3":
+        raise task_c_trace.TaskCTraceError(f"preflight JAX version is not 0.5.3: {receipt['jax_version']}")
+    if not receipt["device_kinds"] or any("H100" not in kind for kind in receipt["device_kinds"]):
+        raise task_c_trace.TaskCTraceError(f"preflight did not run on H100: {receipt['device_kinds']}")
+    receipt["checkpoint_verification"] = checkpoint_verification
+    task_c_trace.write_json_atomic(output / "preflight.json", receipt)
     print(json.dumps(receipt, sort_keys=True))
     return receipt
 
@@ -325,6 +363,7 @@ def run_condition(
     checkpoint: pathlib.Path,
     wm_checkpoint: pathlib.Path,
     checkpoint_manifest_path: pathlib.Path,
+    preflight_receipt_path: pathlib.Path,
     condition: str,
     output: pathlib.Path,
     trials_per_task: int,
@@ -344,7 +383,17 @@ def run_condition(
     run_id = f"c1-{condition}-seed{seed}-tasks{task_id_start}-{task_id_start + task_id_count - 1}"
     port = _find_port()
     provenance = output / "provenance"
+    checkpoint_verification = verify_checkpoint_manifest(checkpoint.parent, checkpoint_manifest_path)
     checkpoint_manifest_sha = task_c_trace.sha256_file(checkpoint_manifest_path)
+    preflight_receipt_path = preflight_receipt_path.resolve()
+    preflight_receipt = json.loads(preflight_receipt_path.read_text(encoding="utf-8"))
+    if (
+        preflight_receipt.get("backend") != "gpu"
+        or preflight_receipt.get("jax_version") != "0.5.3"
+        or not preflight_receipt.get("device_kinds")
+        or any("H100" not in kind for kind in preflight_receipt["device_kinds"])
+    ):
+        raise task_c_trace.TaskCTraceError("run requires a successful JAX 0.5.3 H100 preflight receipt")
     manifest = {
         "schema_version": task_c_trace.SCHEMA_VERSION,
         "status": "running",
@@ -370,6 +419,11 @@ def run_condition(
             "root": str(checkpoint.parent),
             "manifest": str(checkpoint_manifest_path),
             "manifest_sha256": checkpoint_manifest_sha,
+            "verification": checkpoint_verification,
+        },
+        "preflight": {
+            "path": str(preflight_receipt_path),
+            "sha256": task_c_trace.sha256_file(preflight_receipt_path),
         },
         "world_model": {
             "root": str(wm_checkpoint),
@@ -381,9 +435,13 @@ def run_condition(
         "environments": {
             "policy": _freeze(policy_python, provenance / "policy-freeze.txt"),
             "libero": _freeze(libero_python, provenance / "libero-freeze.txt"),
+            "libero_lock": {
+                "path": str(repo / "scripts" / "requirements-task-c-libero.txt"),
+                "sha256": task_c_trace.sha256_file(repo / "scripts" / "requirements-task-c-libero.txt"),
+            },
         },
         "timing": {
-            "c_tier0_boundary": "jitted 40M WM forward including latent reducer and device kappa reduction, plus host kappa materialization",
+            "c_tier0_boundary": "jitted 40M WM forward including latent reducer and device kappa reduction, host kappa materialization, and the threshold decision",
             "warmup_wm_calls_discarded": 30,
         },
         "phase_proxy": {
@@ -393,7 +451,7 @@ def run_condition(
         "mu_split": "episode_idx even calibration; odd eval; split excludes condition and outcome",
         "denoise_pairing_caveat": "not applicable: this JAX evaluation uses the released policy RNG stream per condition",
     }
-    _write_json(output / "run_manifest.json", manifest)
+    task_c_trace.write_json_atomic(output / "run_manifest.json", manifest)
 
     common_env = _base_env(repo)
     common_env["CUDA_VISIBLE_DEVICES"] = cuda_device
@@ -480,7 +538,7 @@ def run_condition(
                 str(kappa_delta),
             ]
         )
-    _write_json(output / "commands.json", {"server": server_command, "client": client_command})
+    task_c_trace.write_json_atomic(output / "commands.json", {"server": server_command, "client": client_command})
     server_log = (output / "serve.log").open("wb")
     client_log = (output / "client.log").open("wb")
     server = subprocess.Popen(
@@ -498,7 +556,7 @@ def run_condition(
         client_env["LIBERO_CONFIG_PATH"] = str(output / "libero_config")
         config_dir = output / "libero_config"
         config_dir.mkdir()
-        _write_json(
+        task_c_trace.write_json_atomic(
             config_dir / "config.yaml.json",
             {
                 "assets": str(repo / "third_party" / "libero" / "libero" / "assets"),
@@ -523,7 +581,7 @@ def run_condition(
             manifest["status"] = "failed"
             manifest["client_returncode"] = client.returncode
             manifest["ended_at"] = _now()
-            _write_json(output / "run_manifest.json", manifest)
+            task_c_trace.write_json_atomic(output / "run_manifest.json", manifest)
             raise task_c_trace.TaskCTraceError(
                 f"LIBERO client failed for {condition} with rc={client.returncode}; see {output / 'client.log'}"
             )
@@ -532,14 +590,14 @@ def run_condition(
         server_log.close()
         client_log.close()
     manifest["ended_at"] = _now()
-    _write_json(output / "run_manifest.json", manifest)
+    task_c_trace.write_json_atomic(output / "run_manifest.json", manifest)
     summary = task_c_analysis.finalize_condition(output)
     print(json.dumps(summary, sort_keys=True))
     return summary
 
 
 def _parse_args() -> argparse.Namespace:
-    root = pathlib.Path("/home/pinyarash/dev/pinyarash/jetson-pi-task-c")
+    root = pathlib.Path(os.environ.get("TASK_C_ROOT", "/home/pinyarash/dev/pinyarash/jetson-pi-task-c"))
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", type=pathlib.Path, default=_repo_root())
     parser.add_argument("--artifact-root", type=pathlib.Path, default=root)
@@ -551,6 +609,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--policy-python", type=pathlib.Path, default=root / "envs" / "policy" / "bin" / "python")
     parser.add_argument("--libero-python", type=pathlib.Path, default=root / "envs" / "libero" / "bin" / "python")
     parser.add_argument("--cuda-device", default="0")
+    parser.add_argument("--preflight-receipt", type=pathlib.Path, default=root / "preflight" / "preflight.json")
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("checkpoint-manifest")
     preflight_parser = subparsers.add_parser("preflight")
@@ -579,6 +638,7 @@ def main() -> None:
             policy_python=args.policy_python,
             checkpoint=pi_checkpoint,
             wm_checkpoint=wm_checkpoint,
+            checkpoint_manifest_path=args.artifact_root / "provenance" / "checkpoint_manifest.json",
             output=args.out,
             cuda_device=args.cuda_device,
         )
@@ -590,6 +650,7 @@ def main() -> None:
             checkpoint=pi_checkpoint,
             wm_checkpoint=wm_checkpoint,
             checkpoint_manifest_path=args.artifact_root / "provenance" / "checkpoint_manifest.json",
+            preflight_receipt_path=args.preflight_receipt,
             condition=args.condition,
             output=args.out,
             trials_per_task=args.trials_per_task,
