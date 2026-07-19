@@ -556,14 +556,24 @@ def run_condition(
         client_env["LIBERO_CONFIG_PATH"] = str(output / "libero_config")
         config_dir = output / "libero_config"
         config_dir.mkdir()
+        libero_package = repo / "third_party" / "libero" / "libero" / "libero"
+        required_libero_paths = [
+            libero_package,
+            libero_package / "assets",
+            libero_package / "bddl_files",
+            libero_package / "init_files",
+        ]
+        missing_libero_paths = [str(path) for path in required_libero_paths if not path.is_dir()]
+        if missing_libero_paths:
+            raise task_c_trace.TaskCTraceError(f"missing required LIBERO package data: {missing_libero_paths}")
         task_c_trace.write_json_atomic(
             config_dir / "config.yaml.json",
             {
-                "assets": str(repo / "third_party" / "libero" / "libero" / "assets"),
-                "bddl_files": str(repo / "third_party" / "libero" / "libero" / "bddl_files"),
-                "benchmark_root": str(repo / "third_party" / "libero" / "libero"),
-                "datasets": str(repo / "third_party" / "libero" / "datasets"),
-                "init_states": str(repo / "third_party" / "libero" / "libero" / "init_files"),
+                "assets": str(libero_package / "assets"),
+                "bddl_files": str(libero_package / "bddl_files"),
+                "benchmark_root": str(libero_package),
+                "datasets": str(libero_package.parent / "datasets"),
+                "init_states": str(libero_package / "init_files"),
             },
         )
         # LIBERO requires YAML at this exact path; JSON is valid YAML and keeps
