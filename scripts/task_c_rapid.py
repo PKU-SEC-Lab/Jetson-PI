@@ -21,6 +21,16 @@ SHARED_EXECUTION_PATH_VERSION = "jetson-pi-task-c-rapid-shared-path-v1"
 DEFAULT_KAPPA_DELTA = 0.4
 
 
+def threshold_payload_sha256(document: Mapping[str, Any]) -> str:
+    payload = {
+        "schema_version": document.get("schema_version"),
+        "formula_version": document.get("formula_version"),
+        "motion_quantile": document.get("motion_quantile"),
+        "thresholds": document.get("thresholds"),
+    }
+    return task_c_trace.sha256_bytes(task_c_trace.canonical_json_bytes(payload))
+
+
 def _unique(records: Sequence[Mapping[str, Any]], key: str) -> dict[str, Mapping[str, Any]]:
     output: dict[str, Mapping[str, Any]] = {}
     for record in records:
@@ -29,10 +39,6 @@ def _unique(records: Sequence[Mapping[str, Any]], key: str) -> dict[str, Mapping
             raise task_c_trace.TaskCTraceError(f"duplicate raw-row {key}: {value}")
         output[value] = record
     return output
-
-
-def _ratio(numerator: int, denominator: int) -> float | None:
-    return float(numerator / denominator) if denominator else None
 
 
 def _rapid_policy_rows(
@@ -63,7 +69,7 @@ def _rapid_policy_rows(
         if len(routing_policies) != 1:
             raise task_c_trace.TaskCTraceError(f"invalid RAPID routing-policy trace for {policy_call_id}")
         routing_policy = routing_policies.pop()
-        if routing_policy not in {"always_infer", "rapid"}:
+        if routing_policy not in rapid_trigger.RAPID_ROUTING_POLICIES:
             raise task_c_trace.TaskCTraceError(f"invalid RAPID routing-policy trace for {policy_call_id}")
         round_zero = [call for call in calls if int(call["round_index"]) == 0]
         if len(round_zero) != 1:
@@ -72,7 +78,8 @@ def _rapid_policy_rows(
         eligible = [call for call in calls if int(call["round_index"]) > 0]
         if not eligible:
             raise task_c_trace.TaskCTraceError(f"RAPID policy call {policy_call_id} has no eligible round")
-        kappa_route = "infer" if any(float(call["kappa"]) < kappa0 - kappa_delta for call in eligible) else "skip"
+        comparison_call = eligible[0]
+        kappa_route = "infer" if float(comparison_call["kappa"]) < kappa0 - kappa_delta else "skip"
         trigger_compute_ns = rapid.get("trigger_compute_ns")
         if isinstance(trigger_compute_ns, bool) or not isinstance(trigger_compute_ns, int) or trigger_compute_ns < 0:
             raise task_c_trace.TaskCTraceError(f"invalid trigger timing for {policy_call_id}")
@@ -88,6 +95,8 @@ def _rapid_policy_rows(
                 "rapid_decision": decision,
                 "executed_decision": "infer" if routing_policy == "always_infer" else decision,
                 "kappa_decision": kappa_route,
+                "kappa_comparison_round": int(comparison_call["round_index"]),
+                "agreement_semantics": "first eligible 40M kappa gate at the same trigger env_step",
                 "decision_agreement": decision == kappa_route,
                 "trigger_compute_ns": trigger_compute_ns,
                 "rapid": rapid,
@@ -102,7 +111,7 @@ def _phase_by_key(steps: Sequence[Mapping[str, Any]]) -> dict[tuple[str, int], s
 
 def _skip_metrics(calls: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     skips = sum(str(call["rapid_decision"]) == "skip" for call in calls)
-    return {"decisions": len(calls), "skips": skips, "skip_rate": _ratio(skips, len(calls))}
+    return {"decisions": len(calls), "skips": skips, "skip_rate": task_c_trace.ratio(skips, len(calls))}
 
 
 def paired_raw_result(
@@ -177,8 +186,10 @@ def paired_raw_result(
         "decisions": len(rapid_calls),
         "agreements": agreements,
         "disagreements": len(rapid_calls) - agreements,
-        "agreement_rate": _ratio(agreements, len(rapid_calls)),
+        "agreement_rate": task_c_trace.ratio(agreements, len(rapid_calls)),
         "kappa_delta": float(kappa_delta),
+        "semantics": "first eligible 40M kappa gate at the same trigger env_step",
+        "coverage_rate": 1.0,
     }
     ni_pass = float(paired_bootstrap["lower_95_one_sided"]) >= noninferiority_margin
     mcnemar_no_harm = not (
@@ -209,6 +220,7 @@ def paired_raw_result(
         "valid_skip_rate": anchored_skip["skip_rate"] if validity else None,
         "contact_vs_approach_failures": per_phase,
         "trigger_compute_us": timing,
+        "per_step_decision_agreement": agreement,
         "kappa_decision_agreement": agreement,
         "rapid_policy_calls": rapid_calls,
     }
@@ -391,10 +403,22 @@ def assert_eval_arm_equivalence(
     if baseline_manifest.get("shared_execution_path") != candidate_manifest.get("shared_execution_path"):
         raise task_c_trace.TaskCTraceError("eval arms do not have a byte-identical shared execution path")
     shared = baseline_manifest.get("shared_execution_path")
-    if not isinstance(shared, Mapping) or shared.get("arms_share_byte_identical_paths") is not True:
+    if (
+        not isinstance(shared, Mapping)
+        or shared.get("arms_share_byte_identical_paths") is not True
+        or shared.get("verified_against_git_head") is not True
+    ):
         raise task_c_trace.TaskCTraceError("shared execution path lacks the mandatory equality assertion")
+    if baseline_manifest.get("arm_execution_contract") != candidate_manifest.get("arm_execution_contract"):
+        raise task_c_trace.TaskCTraceError(
+            "eval arms differ outside routing_policy in checkpoint, environment, scheduler, FAAC, or rollout contract"
+        )
     if baseline_manifest.get("rapid_thresholds_sha256") != candidate_manifest.get("rapid_thresholds_sha256"):
         raise task_c_trace.TaskCTraceError("eval arms loaded different frozen RAPID threshold bytes")
+    if baseline_manifest.get("rapid_threshold_payload_sha256") != candidate_manifest.get(
+        "rapid_threshold_payload_sha256"
+    ):
+        raise task_c_trace.TaskCTraceError("eval arms loaded different RAPID threshold payloads")
     if baseline_manifest.get("only_manipulated_variable") != "routing_policy" or candidate_manifest.get(
         "only_manipulated_variable"
     ) != "routing_policy":
@@ -415,18 +439,33 @@ def shared_execution_path(repo: pathlib.Path) -> dict[str, Any]:
         "packages/openpi-client/src/openpi_client/rapid_trigger.py",
         "src/openpi/policies/pi0_async_inference_policy.py",
     ]
-    files = [
-        {"path": relative, "sha256": task_c_trace.sha256_file(repo / relative)} for relative in relative_paths
-    ]
+    head = _run_git(repo, ["rev-parse", "HEAD"]).decode().strip()
+    files: list[dict[str, Any]] = []
+    for relative in relative_paths:
+        working_bytes = (repo / relative).read_bytes()
+        committed_bytes = _run_git(repo, ["show", f"HEAD:{relative}"])
+        if working_bytes != committed_bytes:
+            raise task_c_trace.TaskCTraceError(
+                f"shared RAPID execution path is not committed before model load: {relative}"
+            )
+        files.append(
+            {
+                "path": relative,
+                "sha256": task_c_trace.sha256_bytes(working_bytes),
+                "matches_git_head": True,
+            }
+        )
     digest = task_c_trace.sha256_bytes(task_c_trace.canonical_json_bytes(files))
     return {
         "schema_version": SHARED_EXECUTION_PATH_VERSION,
+        "git_head": head,
         "digest": digest,
         "files": files,
         "infer_path": "Pi0AsyncInferencePolicy._infer_wm_multi_rollout_ae -> _LowKappaFullPi0Fallback",
         "fallback_path": "_make_wm_low_replan_two_phase_fn -> WebsocketClientPolicy.infer",
         "faac_path": "world-model mu -> shared action-expert sampling/merge",
         "routing_seam": "openpi_client.rapid_trigger.route_decision",
+        "verified_against_git_head": True,
         "arms_share_byte_identical_paths": True,
     }
 
@@ -479,7 +518,52 @@ def load_gate_config(path: pathlib.Path) -> dict[str, Any]:
             raise task_c_trace.TaskCTraceError(f"RAPID calibration gates missing {key}")
     if document["bootstrap"].get("method") != "paired_percentile":
         raise task_c_trace.TaskCTraceError("RAPID bootstrap method must be paired_percentile")
+    document["partition_disjointness"] = validate_disjoint_partitions(document)
     return document
+
+
+def validate_disjoint_partitions(gate_config: Mapping[str, Any]) -> dict[str, Any]:
+    partitions = gate_config.get("calibration_partitions")
+    if not isinstance(partitions, Mapping) or set(partitions) != {"cal_fit", "cal_confirm", "final_eval"}:
+        raise task_c_trace.TaskCTraceError("RAPID gates require exactly Cal-Fit, Cal-Confirm, and final partitions")
+    identities: dict[str, set[tuple[int, int, int]]] = {}
+    receipts: dict[str, Any] = {}
+    for name, raw_partition in partitions.items():
+        if not isinstance(raw_partition, Mapping):
+            raise task_c_trace.TaskCTraceError(f"RAPID partition {name} must be an object")
+        start = int(raw_partition["episode_idx_start"])
+        stop = int(raw_partition["episode_idx_stop_exclusive"])
+        task_ids = [int(value) for value in raw_partition["task_ids"]]
+        seed = int(raw_partition["seed"])
+        if start < 0 or stop <= start or len(task_ids) != len(set(task_ids)):
+            raise task_c_trace.TaskCTraceError(f"invalid RAPID partition bounds/tasks for {name}")
+        rows = {(seed, task_id, episode_idx) for task_id in task_ids for episode_idx in range(start, stop)}
+        if len(rows) != int(raw_partition["expected_pairs"]):
+            raise task_c_trace.TaskCTraceError(
+                f"RAPID partition {name} expected_pairs does not equal its numeric task/init product"
+            )
+        identities[str(name)] = rows
+        receipts[str(name)] = {
+            "rows": len(rows),
+            "identity_sha256": task_c_trace.sha256_bytes(
+                task_c_trace.canonical_json_bytes(sorted(rows))
+            ),
+        }
+    overlaps: dict[str, int] = {}
+    names = sorted(identities)
+    for left_index, left in enumerate(names):
+        for right in names[left_index + 1 :]:
+            count = len(identities[left].intersection(identities[right]))
+            overlaps[f"{left}__{right}"] = count
+    total_overlap = sum(overlaps.values())
+    if total_overlap:
+        raise task_c_trace.TaskCTraceError(f"RAPID calibration/eval partition overlap: {overlaps}")
+    return {
+        "computed_from_numeric_partitions": True,
+        "pairwise_overlap_count": 0,
+        "overlaps": overlaps,
+        "partitions": receipts,
+    }
 
 
 def verify_condition_receipt(root: pathlib.Path) -> dict[str, Any]:
@@ -563,7 +647,12 @@ def cal_fit_from_roots(
     results: dict[float, dict[str, Any]] = {}
     candidate_receipts: dict[str, Any] = {}
     for quantile, root in sorted(candidate_roots.items()):
-        candidate_receipts[str(quantile)] = verify_condition_receipt(root)
+        manifest = json.loads((root / "run_manifest.json").read_text(encoding="utf-8"))
+        candidate_receipts[str(quantile)] = {
+            **verify_condition_receipt(root),
+            "threshold_document_sha256": manifest.get("rapid_thresholds_sha256"),
+            "threshold_payload_sha256": manifest.get("rapid_threshold_payload_sha256"),
+        }
         candidate = task_c_trace.read_jsonl(root / "episodes.jsonl")
         validate_partition(candidate, partition, label=f"Cal-Fit q={quantile}")
         result = _raw_result_from_roots(
@@ -574,6 +663,9 @@ def cal_fit_from_roots(
         )
         results[float(quantile)] = result
     selection = select_cal_fit_candidate(results, gates)
+    selected_receipt = candidate_receipts[str(selection["selected_motion_quantile"])]
+    selection["selected_threshold_document_sha256"] = selected_receipt["threshold_document_sha256"]
+    selection["selected_threshold_payload_sha256"] = selected_receipt["threshold_payload_sha256"]
     compact_results = {
         str(quantile): {key: value for key, value in result.items() if key != "rapid_policy_calls"}
         for quantile, result in sorted(results.items())
@@ -597,6 +689,15 @@ def cal_confirm_from_roots(
     partition = gates["calibration_partitions"]["cal_confirm"]
     baseline_receipt = verify_condition_receipt(baseline_root)
     candidate_receipt = verify_condition_receipt(candidate_root)
+    baseline_manifest = json.loads((baseline_root / "run_manifest.json").read_text(encoding="utf-8"))
+    candidate_manifest = json.loads((candidate_root / "run_manifest.json").read_text(encoding="utf-8"))
+    arm_equivalence = assert_eval_arm_equivalence(baseline_manifest, candidate_manifest)
+    threshold_binding = {
+        "threshold_document_sha256": candidate_manifest.get("rapid_thresholds_sha256"),
+        "threshold_payload_sha256": candidate_manifest.get("rapid_threshold_payload_sha256"),
+    }
+    if not all(threshold_binding.values()):
+        raise task_c_trace.TaskCTraceError("Cal-Confirm candidate manifest lacks its threshold binding")
     baseline = task_c_trace.read_jsonl(baseline_root / "episodes.jsonl")
     candidate = task_c_trace.read_jsonl(candidate_root / "episodes.jsonl")
     partition_receipt = validate_partition(baseline, partition, label="Cal-Confirm baseline")
@@ -614,6 +715,8 @@ def cal_confirm_from_roots(
         "partition": partition_receipt,
         "baseline_receipt": baseline_receipt,
         "candidate_receipt": candidate_receipt,
+        "arm_path_equivalence": arm_equivalence,
+        "tested_threshold_binding": threshold_binding,
         "decision": decision,
         "result": {key: value for key, value in result.items() if key != "rapid_policy_calls"},
     }
@@ -632,10 +735,28 @@ def frozen_threshold_document(
     selected_quantile = float(fit["selection"]["selected_motion_quantile"])
     if float(selected_document["motion_quantile"]) != selected_quantile:
         raise task_c_trace.TaskCTraceError("selected threshold document does not match computed Cal-Fit winner")
+    selected_document_sha = task_c_trace.sha256_bytes(
+        task_c_trace.canonical_json_bytes(dict(selected_document)) + b"\n"
+    )
+    selected_payload_sha = threshold_payload_sha256(selected_document)
+    fit_document_sha = fit["selection"].get("selected_threshold_document_sha256")
+    fit_payload_sha = fit["selection"].get("selected_threshold_payload_sha256")
+    confirm_binding = confirm.get("tested_threshold_binding", {})
+    if (
+        selected_document_sha != fit_document_sha
+        or selected_document_sha != confirm_binding.get("threshold_document_sha256")
+        or selected_payload_sha != fit_payload_sha
+        or selected_payload_sha != confirm_binding.get("threshold_payload_sha256")
+    ):
+        raise task_c_trace.TaskCTraceError(
+            "threshold document/payload being frozen is not byte-bound to both Cal-Fit and Cal-Confirm"
+        )
     document = dict(selected_document)
     document["freeze"] = {
         "selection_computed_from_raw_rows": True,
         "selected_motion_quantile": selected_quantile,
+        "selected_threshold_document_sha256": selected_document_sha,
+        "selected_threshold_payload_sha256": selected_payload_sha,
         "cal_fit_receipt": str(cal_fit_receipt_path.resolve()),
         "cal_fit_receipt_sha256": task_c_trace.sha256_file(cal_fit_receipt_path),
         "cal_confirm_receipt": str(cal_confirm_receipt_path.resolve()),
@@ -657,6 +778,10 @@ def baseline_reconciliation(
     baseline_manifest = json.loads((baseline_root / "run_manifest.json").read_text(encoding="utf-8"))
     if baseline_manifest.get("calibration_stage") != "final_eval":
         raise task_c_trace.TaskCTraceError("baseline reconciliation requires a final_eval manifest")
+    if baseline_manifest.get("routing_policy") != "always_infer":
+        raise task_c_trace.TaskCTraceError("baseline reconciliation requires the always-infer arm")
+    if not baseline_manifest.get("rapid_threshold_seal") or not baseline_manifest.get("arm_execution_contract"):
+        raise task_c_trace.TaskCTraceError("baseline reconciliation requires sealed thresholds and arm contract")
     final_partition = gates["calibration_partitions"]["final_eval"]
     baseline_episodes = task_c_trace.read_jsonl(baseline_root / "episodes.jsonl")
     validate_partition(baseline_episodes, final_partition, label="final always-infer baseline")
@@ -671,6 +796,10 @@ def baseline_reconciliation(
     receipt = {
         "hard_abort_on_failure": True,
         "passed": passed,
+        "baseline_root": str(baseline_root.resolve()),
+        "baseline_run_manifest_sha256": task_c_trace.sha256_file(baseline_root / "run_manifest.json"),
+        "rapid_thresholds_sha256": baseline_manifest.get("rapid_thresholds_sha256"),
+        "rapid_threshold_payload_sha256": baseline_manifest.get("rapid_threshold_payload_sha256"),
         "sealed_c1_receipt": sealed_receipt,
         "sealed_c1_success_rate": sealed_rate,
         "rapid_always_infer_success_rate": baseline_rate,
@@ -898,7 +1027,16 @@ def main() -> None:
     else:
         gates = load_gate_config(args.gates)
         if args.command == "derive-ladder":
+            verify_condition_receipt(args.baseline)
             episodes = task_c_trace.read_jsonl(args.baseline / "episodes.jsonl")
+            partition_receipt = validate_partition(
+                episodes,
+                gates["calibration_partitions"]["cal_fit"],
+                label="threshold-derivation Cal-Fit baseline",
+            )
+            baseline_manifest = json.loads((args.baseline / "run_manifest.json").read_text(encoding="utf-8"))
+            if baseline_manifest.get("calibration_stage") != "cal_fit":
+                raise task_c_trace.TaskCTraceError("threshold derivation requires a Cal-Fit baseline receipt")
             observations = task_c_trace.read_jsonl(args.baseline / "proprio_observations.jsonl")
             ladder = derive_threshold_ladder(
                 episodes,
@@ -911,7 +1049,7 @@ def main() -> None:
             for document in ladder:
                 quantile = round(float(document["motion_quantile"]) * 100)
                 write_json(args.out / f"rapid_thresholds_q{quantile:02d}.json", document)
-            result = {"documents": len(ladder), "out": str(args.out)}
+            result = {"documents": len(ladder), "out": str(args.out), "partition": partition_receipt}
         elif args.command == "pair-raw":
             baseline, _, _ = _load_condition_rows(args.baseline)
             candidate, calls, steps = _load_condition_rows(args.candidate)

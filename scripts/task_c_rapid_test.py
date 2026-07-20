@@ -67,6 +67,29 @@ def _steps(count: int) -> list[dict[str, object]]:
 
 def _gate_config() -> dict[str, object]:
     return {
+        "calibration_partitions": {
+            "cal_fit": {
+                "task_ids": [0],
+                "episode_idx_start": 10,
+                "episode_idx_stop_exclusive": 20,
+                "seed": 42,
+                "expected_pairs": 10,
+            },
+            "cal_confirm": {
+                "task_ids": [0],
+                "episode_idx_start": 20,
+                "episode_idx_stop_exclusive": 30,
+                "seed": 42,
+                "expected_pairs": 10,
+            },
+            "final_eval": {
+                "task_ids": [0],
+                "episode_idx_start": 0,
+                "episode_idx_stop_exclusive": 10,
+                "seed": 42,
+                "expected_pairs": 10,
+            },
+        },
         "bootstrap": {"method": "paired_percentile", "samples": 1000, "seed": 17},
         "cal_fit": {
             "mcnemar_p_value_min_inclusive": 0.05,
@@ -105,6 +128,25 @@ def test_raw_pair_result_deduplicates_policy_calls_and_reports_kappa_agreement()
     assert result["trigger_compute_us"]["mean"] == 2.0
     assert result["kappa_decision_agreement"]["agreement_rate"] == 1.0
     assert result["paired_bootstrap"]["method"] == "paired_percentile"
+
+
+def test_kappa_agreement_is_the_first_eligible_gate_at_the_same_trigger_step() -> None:
+    calls = _rapid_wm_calls(["skip"])
+    calls.append({**calls[-1], "wm_call_id": "wm-0-2", "round_index": 2, "kappa": 0.0})
+
+    result = task_c_rapid.paired_raw_result(
+        _episodes([True], condition="rapid_always_infer"),
+        _episodes([True], condition="rapid"),
+        calls,
+        _steps(1),
+        bootstrap_samples=1000,
+        bootstrap_seed=17,
+        noninferiority_margin=-0.05,
+        kappa_delta=0.4,
+    )
+
+    assert result["per_step_decision_agreement"]["agreement_rate"] == 1.0
+    assert result["rapid_policy_calls"][0]["kappa_comparison_round"] == 1
 
 
 def test_cal_fit_selection_is_computed_and_never_eyeballed() -> None:
@@ -190,7 +232,12 @@ def test_eval_arm_contract_rejects_any_shared_path_drift() -> None:
         "condition": "rapid_always_infer",
         "routing_policy": "always_infer",
         "rapid_thresholds_sha256": "threshold-sha",
-        "shared_execution_path": {"digest": "same", "arms_share_byte_identical_paths": True},
+        "shared_execution_path": {
+            "digest": "same",
+            "arms_share_byte_identical_paths": True,
+            "verified_against_git_head": True,
+        },
+        "arm_execution_contract": {"checkpoint": "same", "scheduler": "same"},
         "only_manipulated_variable": "routing_policy",
     }
     candidate = copy.deepcopy(baseline)
@@ -200,6 +247,62 @@ def test_eval_arm_contract_rejects_any_shared_path_drift() -> None:
     candidate["shared_execution_path"]["digest"] = "different"
     with pytest.raises(task_c_trace.TaskCTraceError, match="shared execution path"):
         task_c_rapid.assert_eval_arm_equivalence(baseline, candidate)
+
+
+def test_gate_partitions_must_be_pairwise_disjoint() -> None:
+    gates = _gate_config()
+    receipt = task_c_rapid.validate_disjoint_partitions(gates)
+    assert receipt["pairwise_overlap_count"] == 0
+
+    gates["calibration_partitions"]["cal_confirm"]["episode_idx_start"] = 19
+    gates["calibration_partitions"]["cal_confirm"]["expected_pairs"] = 11
+    with pytest.raises(task_c_trace.TaskCTraceError, match="overlap"):
+        task_c_rapid.validate_disjoint_partitions(gates)
+
+
+def test_freeze_is_bound_to_exact_cal_fit_and_cal_confirm_threshold_bytes(tmp_path) -> None:
+    selected = {
+        "schema_version": "jetson-pi-task-c-rapid-thresholds-v1",
+        "formula_version": "rapid-kinematic-v1",
+        "motion_quantile": 0.8,
+        "thresholds": {"theta_v": 0.1},
+    }
+    selected_path = tmp_path / "selected.json"
+    task_c_trace.write_json_atomic(selected_path, selected)
+    document_sha = task_c_trace.sha256_file(selected_path)
+    payload_sha = task_c_rapid.threshold_payload_sha256(selected)
+    fit_path = tmp_path / "fit.json"
+    confirm_path = tmp_path / "confirm.json"
+    gates_path = tmp_path / "gates.json"
+    task_c_trace.write_json_atomic(
+        fit_path,
+        {
+            "selection": {
+                "selected_motion_quantile": 0.8,
+                "selected_threshold_document_sha256": document_sha,
+                "selected_threshold_payload_sha256": payload_sha,
+            }
+        },
+    )
+    task_c_trace.write_json_atomic(
+        confirm_path,
+        {
+            "decision": {"abort": False},
+            "tested_threshold_binding": {
+                "threshold_document_sha256": document_sha,
+                "threshold_payload_sha256": payload_sha,
+            },
+        },
+    )
+    task_c_trace.write_json_atomic(gates_path, {})
+
+    frozen = task_c_rapid.frozen_threshold_document(selected, fit_path, confirm_path, gates_path)
+    assert frozen["freeze"]["selected_threshold_payload_sha256"] == payload_sha
+
+    changed = copy.deepcopy(selected)
+    changed["thresholds"]["theta_v"] = 0.2
+    with pytest.raises(task_c_trace.TaskCTraceError, match="not byte-bound"):
+        task_c_rapid.frozen_threshold_document(changed, fit_path, confirm_path, gates_path)
 
 
 def test_rapid_runner_spec_keeps_threshold_and_shared_scheduler_flags_identical() -> None:

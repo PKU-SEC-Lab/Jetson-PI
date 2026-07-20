@@ -380,12 +380,14 @@ def finalize_condition(output_root: pathlib.Path) -> dict[str, Any]:
                 "trigger_compute_us": task_c_trace.percentile_summary(
                     [float(call["trigger_compute_ns"]) / 1000.0 for call in rapid_calls]
                 ),
-                "kappa_decision_agreement": {
+                "per_step_decision_agreement_with_40m_kappa": {
                     "agreements": sum(bool(call["decision_agreement"]) for call in rapid_calls),
                     "disagreements": sum(not bool(call["decision_agreement"]) for call in rapid_calls),
                     "agreement_rate": task_c_trace.ratio(
                         sum(bool(call["decision_agreement"]) for call in rapid_calls), len(rapid_calls)
                     ),
+                    "semantics": "first eligible 40M kappa gate at the same trigger env_step",
+                    "coverage_rate": 1.0,
                 },
                 "raw_rows": "rapid_calls.jsonl",
             }

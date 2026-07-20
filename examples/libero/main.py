@@ -583,6 +583,8 @@ def eval_libero(args: Args) -> None:
         raise ValueError(
             "async_wm_multi_rollout_adaptive_kappa_low_replan=True requires async_wm_multi_rollout_adaptive_kappa=True"
         )
+    if args.async_wm_routing_policy not in rapid_trigger.ROUTING_POLICIES:
+        raise ValueError(f"unknown async_wm_routing_policy: {args.async_wm_routing_policy!r}")
     if args.async_wm_routing_policy != "kappa":
         if not args.async_wm_multi_rollout_adaptive_kappa_low_replan:
             raise ValueError(

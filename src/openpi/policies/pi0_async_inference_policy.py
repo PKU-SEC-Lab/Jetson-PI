@@ -462,7 +462,7 @@ class Pi0AsyncInferencePolicy(_base_policy.BasePolicy):
         adaptive = bool(mr.get("adaptive_kappa"))
         low_replan = bool(mr.get("adaptive_kappa_low_replan"))
         routing_policy = str(mr.get("routing_policy", "kappa"))
-        if routing_policy not in {"kappa", "always_infer", "rapid"}:
+        if routing_policy not in _rapid_trigger.ROUTING_POLICIES:
             raise ValueError(f"unknown wm_multi_rollout.routing_policy: {routing_policy!r}")
         rapid_payload = mr.get("rapid")
         if rapid_payload is not None and not isinstance(rapid_payload, dict):

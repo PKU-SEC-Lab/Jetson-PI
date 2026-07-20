@@ -15,6 +15,7 @@ import time
 from typing import Any
 import urllib.request
 
+from openpi_client import rapid_trigger
 from openpi_client import task_c_trace
 
 from scripts import task_c_analysis
@@ -42,7 +43,7 @@ def rapid_condition_spec(
 ) -> dict[str, Any]:
     """Return the frozen shared scheduler contract for a RAPID arm."""
 
-    if routing_policy not in {"always_infer", "rapid"}:
+    if routing_policy not in rapid_trigger.RAPID_ROUTING_POLICIES:
         raise ValueError(f"RAPID condition needs always_infer or rapid routing, got {routing_policy!r}")
     if routing_policy == "rapid" and rapid_thresholds_path is None:
         raise ValueError("RAPID routing requires a threshold document")
@@ -413,6 +414,7 @@ def run_condition(
     gate_config_path: pathlib.Path | None = None,
     threshold_sums_path: pathlib.Path | None = None,
     require_threshold_seal: bool = False,
+    baseline_reconciliation_receipt_path: pathlib.Path | None = None,
 ) -> dict[str, Any]:
     rapid_spec = None
     if routing_policy == "kappa":
@@ -430,6 +432,8 @@ def run_condition(
         raise ValueError(f"unknown suite {suite!r}")
     if episode_idx_start < 0:
         raise ValueError("episode_idx_start must be non-negative")
+    if calibration_stage == "final_eval":
+        require_threshold_seal = True
     if rapid_spec is not None and gate_config_path is None and calibration_stage != "smoke":
         raise task_c_trace.TaskCTraceError("every RAPID run requires the precommitted numeric calibration gates")
     gate_receipt = None
@@ -438,17 +442,42 @@ def run_condition(
         gate_config_path = gate_config_path.resolve()
         gate_receipt = task_c_rapid.verify_git_sealed_file(repo, gate_config_path)
         gate_config = task_c_rapid.load_gate_config(gate_config_path)
+        stage_to_partition = {"cal_fit": "cal_fit", "cal_confirm": "cal_confirm", "final_eval": "final_eval"}
+        if calibration_stage in stage_to_partition:
+            partition = gate_config["calibration_partitions"][stage_to_partition[calibration_stage]]
+            expected = {
+                "task_id_start": min(int(value) for value in partition["task_ids"]),
+                "task_id_count": len(partition["task_ids"]),
+                "episode_idx_start": int(partition["episode_idx_start"]),
+                "trials_per_task": int(partition["episode_idx_stop_exclusive"])
+                - int(partition["episode_idx_start"]),
+                "seed": int(partition["seed"]),
+            }
+            actual = {
+                "task_id_start": task_id_start,
+                "task_id_count": task_id_count,
+                "episode_idx_start": episode_idx_start,
+                "trials_per_task": trials_per_task,
+                "seed": seed,
+            }
+            if actual != expected or sorted(int(value) for value in partition["task_ids"]) != list(
+                range(task_id_start, task_id_start + task_id_count)
+            ):
+                raise task_c_trace.TaskCTraceError(
+                    f"{calibration_stage} run arguments do not match the committed numeric partition: "
+                    f"actual={actual}, expected={expected}"
+                )
     rapid_thresholds_receipt = None
     threshold_seal_receipt = None
     if rapid_thresholds_path is not None:
         rapid_thresholds_path = rapid_thresholds_path.resolve()
         # Parse before model load so malformed threshold bytes fail closed.
-        from openpi_client import rapid_trigger
-
         rapid_trigger.load_threshold_document(rapid_thresholds_path)
+        rapid_threshold_document = json.loads(rapid_thresholds_path.read_text(encoding="utf-8"))
         rapid_thresholds_receipt = {
             "path": str(rapid_thresholds_path),
             "sha256": task_c_trace.sha256_file(rapid_thresholds_path),
+            "payload_sha256": task_c_rapid.threshold_payload_sha256(rapid_threshold_document),
         }
         if require_threshold_seal:
             if threshold_sums_path is None:
@@ -460,6 +489,31 @@ def run_condition(
             )
     elif require_threshold_seal:
         raise task_c_trace.TaskCTraceError("sealed eval requires rapid_thresholds_path")
+    baseline_reconciliation_receipt = None
+    if calibration_stage == "final_eval" and routing_policy == "rapid":
+        if baseline_reconciliation_receipt_path is None:
+            raise task_c_trace.TaskCTraceError(
+                "final RAPID candidate cannot start before a passing baseline-reconciliation receipt"
+            )
+        baseline_reconciliation_receipt_path = baseline_reconciliation_receipt_path.resolve()
+        baseline_reconciliation_receipt = json.loads(
+            baseline_reconciliation_receipt_path.read_text(encoding="utf-8")
+        )
+        if baseline_reconciliation_receipt.get("passed") is not True:
+            raise task_c_trace.TaskCTraceError("baseline-reconciliation receipt did not pass")
+        if rapid_thresholds_receipt is None:
+            raise task_c_trace.TaskCTraceError("final RAPID candidate has no threshold receipt")
+        if baseline_reconciliation_receipt.get("rapid_thresholds_sha256") != rapid_thresholds_receipt["sha256"]:
+            raise task_c_trace.TaskCTraceError("baseline reconciliation used different RAPID threshold bytes")
+        if baseline_reconciliation_receipt.get("rapid_threshold_payload_sha256") != rapid_thresholds_receipt[
+            "payload_sha256"
+        ]:
+            raise task_c_trace.TaskCTraceError("baseline reconciliation used a different RAPID threshold payload")
+        baseline_reconciliation_receipt = {
+            **baseline_reconciliation_receipt,
+            "path": str(baseline_reconciliation_receipt_path),
+            "sha256": task_c_trace.sha256_file(baseline_reconciliation_receipt_path),
+        }
     output = output.resolve()
     if output.exists() and any(output.iterdir()):
         raise task_c_trace.TaskCTraceError(f"refusing to overwrite non-empty condition output: {output}")
@@ -486,6 +540,7 @@ def run_condition(
         or any("H100" not in kind for kind in preflight_receipt["device_kinds"])
     ):
         raise task_c_trace.TaskCTraceError("run requires a successful JAX 0.5.3 H100 preflight receipt")
+    shared_path_contract = task_c_rapid.shared_execution_path(repo) if rapid_spec is not None else None
     manifest = {
         "schema_version": task_c_trace.SCHEMA_VERSION,
         "status": "running",
@@ -512,16 +567,20 @@ def run_condition(
         "confidence_schedule": condition != "faac_only" or rapid_spec is not None,
         "wm_still_required_for_faac": True,
         "only_manipulated_variable": "routing_policy" if rapid_spec is not None else None,
-        "shared_execution_path": task_c_rapid.shared_execution_path(repo) if rapid_spec is not None else None,
+        "shared_execution_path": shared_path_contract,
         "rapid_thresholds": rapid_thresholds_receipt,
         "rapid_thresholds_sha256": (
             rapid_thresholds_receipt["sha256"] if rapid_thresholds_receipt is not None else None
+        ),
+        "rapid_threshold_payload_sha256": (
+            rapid_thresholds_receipt["payload_sha256"] if rapid_thresholds_receipt is not None else None
         ),
         "rapid_threshold_seal": threshold_seal_receipt,
         "rapid_calib_gates": gate_receipt,
         "baseline_reconciliation": (
             gate_config.get("baseline_reconciliation") if gate_config is not None else None
         ),
+        "baseline_reconciliation_receipt": baseline_reconciliation_receipt,
         "checkpoint": {
             "model_id": MODEL_ID,
             "resolved_revision": MODEL_REVISION,
@@ -562,6 +621,50 @@ def run_condition(
         "mu_split": "episode_idx parity storage split only; RAPID Cal-Fit/Cal-Confirm/final partitions are manifest-sealed disjoint ranges",
         "denoise_pairing_caveat": "not applicable: this JAX evaluation uses the released policy RNG stream per condition",
     }
+    if rapid_spec is not None:
+        if shared_path_contract is None:
+            raise AssertionError("RAPID shared execution path was not constructed")
+        manifest["arm_execution_contract"] = {
+            "schema_version": "jetson-pi-task-c-rapid-arm-contract-v1",
+            "repo_head": manifest["repo"]["head"],
+            "shared_execution_path": shared_path_contract,
+            "checkpoint": {
+                "model_id": manifest["checkpoint"]["model_id"],
+                "resolved_revision": manifest["checkpoint"]["resolved_revision"],
+                "manifest_sha256": manifest["checkpoint"]["manifest_sha256"],
+            },
+            "preflight_sha256": manifest["preflight"]["sha256"],
+            "world_model": manifest["world_model"],
+            "environment_sha256": {
+                "policy": manifest["environments"]["policy"]["sha256"],
+                "libero": manifest["environments"]["libero"]["sha256"],
+                "libero_lock": manifest["environments"]["libero_lock"]["sha256"],
+            },
+            "matrix": {
+                "experiment": experiment,
+                "suite": suite,
+                "seed": seed,
+                "task_id_start": task_id_start,
+                "task_id_count": task_id_count,
+                "trials_per_task": trials_per_task,
+                "episode_idx_start": episode_idx_start,
+            },
+            "scheduler_and_rollout": rapid_spec["shared_scheduler_flags"],
+            "threshold_document_sha256": manifest["rapid_thresholds_sha256"],
+            "threshold_payload_sha256": manifest["rapid_threshold_payload_sha256"],
+            "calib_gates_sha256": manifest["rapid_calib_gates"]["sha256"] if gate_receipt else None,
+            "infer_fallback_faac_implementation": shared_path_contract["digest"],
+            "wm_still_required_for_faac": True,
+        }
+    if calibration_stage == "final_eval" and routing_policy == "rapid":
+        if baseline_reconciliation_receipt is None:
+            raise AssertionError("final RAPID baseline receipt vanished after validation")
+        baseline_root = pathlib.Path(baseline_reconciliation_receipt["baseline_root"])
+        baseline_manifest = json.loads((baseline_root / "run_manifest.json").read_text(encoding="utf-8"))
+        manifest["paired_arm_equivalence_preload"] = task_c_rapid.assert_eval_arm_equivalence(
+            baseline_manifest,
+            manifest,
+        )
     task_c_trace.write_json_atomic(output / "run_manifest.json", manifest)
 
     common_env = _base_env(repo)
@@ -768,6 +871,7 @@ def _parse_args() -> argparse.Namespace:
     run_parser.add_argument("--rapid-calib-gates", type=pathlib.Path)
     run_parser.add_argument("--threshold-sums", type=pathlib.Path)
     run_parser.add_argument("--require-threshold-seal", action="store_true")
+    run_parser.add_argument("--baseline-reconciliation-receipt", type=pathlib.Path)
     return parser.parse_args()
 
 
@@ -814,6 +918,7 @@ def main() -> None:
             gate_config_path=args.rapid_calib_gates,
             threshold_sums_path=args.threshold_sums,
             require_threshold_seal=args.require_threshold_seal,
+            baseline_reconciliation_receipt_path=args.baseline_reconciliation_receipt,
         )
 
 

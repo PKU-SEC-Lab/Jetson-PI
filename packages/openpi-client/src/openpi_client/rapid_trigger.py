@@ -17,6 +17,8 @@ import numpy as np
 RapidRoute = Literal["skip", "infer"]
 RoutingPolicy = Literal["kappa", "always_infer", "rapid"]
 GripperState = Literal["open", "closed", "transition"]
+ROUTING_POLICIES = frozenset({"kappa", "always_infer", "rapid"})
+RAPID_ROUTING_POLICIES = frozenset({"always_infer", "rapid"})
 THRESHOLD_SCHEMA_VERSION = "jetson-pi-task-c-rapid-thresholds-v1"
 FORMULA_VERSION = "rapid-kinematic-v1"
 
@@ -197,10 +199,12 @@ class RapidKinematicTrigger:
         started_ns = time.perf_counter_ns()
         state = np.asarray(proprio, dtype=np.float64).reshape(-1)
         if state.shape != (8,):
+            self._history.clear()
             self._previous_safe = False
             self._latest_decision = self._fail_closed(started_ns, "proprio_shape")
             return self._latest_decision
         if not np.isfinite(state).all():
+            self._history.clear()
             self._previous_safe = False
             self._latest_decision = self._fail_closed(started_ns, "nonfinite_proprio")
             return self._latest_decision

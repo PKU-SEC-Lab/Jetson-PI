@@ -17,6 +17,8 @@ from typing import Any
 
 import numpy as np
 
+from openpi_client import rapid_trigger
+
 
 SCHEMA_VERSION = "jetson-pi-task-c-v1"
 TRACE_KEY = "openpi/task_c_trace"
@@ -307,7 +309,7 @@ class ServerTraceRecorder:
             raise TaskCTraceError("kappa_decision_ms must be finite and >= 0")
         rapid_fields: dict[str, Any] = {}
         if routing_policy is not None:
-            if routing_policy not in {"kappa", "always_infer", "rapid"}:
+            if routing_policy not in rapid_trigger.ROUTING_POLICIES:
                 raise TaskCTraceError(f"unsupported Task-C routing_policy: {routing_policy!r}")
             rapid_fields["routing_policy"] = routing_policy
         if rapid is not None:
