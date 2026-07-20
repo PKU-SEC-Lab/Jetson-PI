@@ -1,0 +1,83 @@
+{
+  "schema_version": "jetson-pi-task-c-rapid-calib-gates-v1",
+  "formula_version": "rapid-kinematic-v1",
+  "calibration_partitions": {
+    "cal_fit": {
+      "task_ids": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+      "episode_idx_start": 30,
+      "episode_idx_stop_exclusive": 40,
+      "seed": 42,
+      "expected_pairs": 100
+    },
+    "cal_confirm": {
+      "task_ids": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+      "episode_idx_start": 40,
+      "episode_idx_stop_exclusive": 50,
+      "seed": 42,
+      "expected_pairs": 100
+    },
+    "final_eval": {
+      "task_ids": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+      "episode_idx_start": 0,
+      "episode_idx_stop_exclusive": 30,
+      "seed": 42,
+      "expected_pairs": 300
+    }
+  },
+  "ladder": {
+    "motion_quantiles": [0.5, 0.65, 0.8, 0.9, 0.95],
+    "transition_cooldown_steps": 2,
+    "dt": 1.0,
+    "motion_formula": "v_t=||p_t-p_(t-1)||/dt; a_t=||p_t-2p_(t-1)+p_(t-2)||/dt^2; omega_t=angle(R_(t-1)^T R_t)/dt",
+    "gripper_formula": "aperture=q_left-q_right; deterministic two-cluster median centers; theta_closed=closed+gap/3; theta_open=open-gap/3; state flip or hysteresis-band occupancy plus two-tick cooldown vetoes skip",
+    "decision_formula": "skip iff current and previous finite-difference samples are within all frozen motion thresholds and neither observed nor issued gripper commands transition; otherwise infer"
+  },
+  "bootstrap": {
+    "method": "paired_percentile",
+    "samples": 50000,
+    "seed": 20260719,
+    "one_sided_lower_percentile": 5.0,
+    "two_sided_percentiles": [2.5, 97.5]
+  },
+  "cal_fit": {
+    "selection_primary": "max_success_anchored_skip_rate",
+    "selection_statistic_exact": "Among candidates with paired McNemar two-sided exact p>=0.05 AND candidate-minus-baseline success-rate delta>=0.0, select the maximum call-level skip rate restricted to trajectories successful in both paired arms; ties select the lowest motion quantile.",
+    "mcnemar_p_value_min_inclusive": 0.05,
+    "success_rate_delta_min_inclusive": 0.0,
+    "tie_break": "lowest_motion_quantile",
+    "computed_from": ["episodes.jsonl", "server_trace/wm_calls.jsonl", "steps_raw.jsonl"],
+    "manual_override_allowed": false
+  },
+  "cal_confirm": {
+    "abort_logic": "OR",
+    "abort_criterion_exact": "ABORT if (paired McNemar two-sided exact p<0.05 in the harmful direction) OR success-rate delta<-0.05 OR paired-percentile one-sided 95% lower bound<-0.05.",
+    "abort_if_harmful_mcnemar_p_below": 0.05,
+    "abort_if_success_rate_delta_below": -0.05,
+    "abort_if_paired_percentile_lower_one_sided_below": -0.05,
+    "computed_from": ["episodes.jsonl", "server_trace/wm_calls.jsonl", "steps_raw.jsonl"],
+    "retuning_after_failure_allowed": false
+  },
+  "baseline_reconciliation": {
+    "sealed_c1_faac_only_root": "/home/pinyarash/dev/pinyarash/jetson-pi-task-c/c1/faac_only",
+    "max_abs_success_rate_delta": 0.03,
+    "comparison": "abs(rapid_always_infer_success_rate-sealed_c1_faac_only_success_rate)<=0.03",
+    "hard_abort_before_rapid_candidate": true
+  },
+  "final_eval": {
+    "suite": "libero_spatial",
+    "trigger_k": 9,
+    "paired_episodes_per_arm": 300,
+    "same_seed_as_c1": 42,
+    "noninferiority_margin": -0.05,
+    "mcnemar_alpha": 0.05,
+    "kappa_shadow_delta": 0.4,
+    "power_assumed_discordant_pair_rates": [0.05, 0.1, 0.2],
+    "bootstrap_ci_method": "paired_percentile"
+  },
+  "preflight": {
+    "minimum_init_states_per_task": 50,
+    "expected_task_count": 10,
+    "non_eval_smoke_suite": "libero_object",
+    "smoke_rows_excluded_from_calibration_and_eval": true
+  }
+}
