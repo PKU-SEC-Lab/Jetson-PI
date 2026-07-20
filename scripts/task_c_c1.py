@@ -18,6 +18,7 @@ import urllib.request
 from openpi_client import task_c_trace
 
 from scripts import task_c_analysis
+from scripts import task_c_rapid
 
 MODEL_ID = "zebinyang/Jetson-PI-pi05"
 MODEL_REVISION = "a3a803da176b10ab87dc5e29720d47c772848b43"
@@ -31,6 +32,37 @@ CONDITIONS = {
     "kappa_0p8": 0.8,
 }
 SUITES = ("libero_spatial", *task_c_analysis.C3_SUITES)
+
+
+def rapid_condition_spec(
+    *,
+    condition: str,
+    routing_policy: str,
+    rapid_thresholds_path: str | None,
+) -> dict[str, Any]:
+    """Return the frozen shared scheduler contract for a RAPID arm."""
+
+    if routing_policy not in {"always_infer", "rapid"}:
+        raise ValueError(f"RAPID condition needs always_infer or rapid routing, got {routing_policy!r}")
+    if routing_policy == "rapid" and rapid_thresholds_path is None:
+        raise ValueError("RAPID routing requires a threshold document")
+    if condition not in {"rapid_always_infer", "rapid"} and not condition.startswith("rapid_q"):
+        raise ValueError(f"invalid RAPID condition name: {condition!r}")
+    return {
+        "condition": condition,
+        "routing_policy": routing_policy,
+        "rapid_thresholds_path": rapid_thresholds_path,
+        "kappa_delta": task_c_rapid.DEFAULT_KAPPA_DELTA,
+        "shared_scheduler_flags": {
+            "async_wm_multi_rollout": True,
+            "adaptive_kappa": True,
+            "adaptive_kappa_low_replan": True,
+            "wm_rollout_delta_t": 1.0,
+            "overlap": 1,
+            "action_horizon": 10,
+            "trigger_k": 9,
+        },
+    }
 
 
 def _now() -> str:
@@ -373,19 +405,74 @@ def run_condition(
     task_id_count: int,
     seed: int,
     cuda_device: str,
+    episode_idx_start: int = 0,
+    routing_policy: str = "kappa",
+    rapid_thresholds_path: pathlib.Path | None = None,
+    experiment_override: str | None = None,
+    calibration_stage: str | None = None,
+    gate_config_path: pathlib.Path | None = None,
+    threshold_sums_path: pathlib.Path | None = None,
+    require_threshold_seal: bool = False,
 ) -> dict[str, Any]:
-    if condition not in CONDITIONS:
-        raise ValueError(f"unknown condition {condition!r}")
+    rapid_spec = None
+    if routing_policy == "kappa":
+        if condition not in CONDITIONS:
+            raise ValueError(f"unknown kappa condition {condition!r}")
+        kappa_delta = CONDITIONS[condition]
+    else:
+        rapid_spec = rapid_condition_spec(
+            condition=condition,
+            routing_policy=routing_policy,
+            rapid_thresholds_path=str(rapid_thresholds_path) if rapid_thresholds_path is not None else None,
+        )
+        kappa_delta = float(rapid_spec["kappa_delta"])
     if suite not in SUITES:
         raise ValueError(f"unknown suite {suite!r}")
+    if episode_idx_start < 0:
+        raise ValueError("episode_idx_start must be non-negative")
+    if rapid_spec is not None and gate_config_path is None and calibration_stage != "smoke":
+        raise task_c_trace.TaskCTraceError("every RAPID run requires the precommitted numeric calibration gates")
+    gate_receipt = None
+    gate_config = None
+    if gate_config_path is not None:
+        gate_config_path = gate_config_path.resolve()
+        gate_receipt = task_c_rapid.verify_git_sealed_file(repo, gate_config_path)
+        gate_config = task_c_rapid.load_gate_config(gate_config_path)
+    rapid_thresholds_receipt = None
+    threshold_seal_receipt = None
+    if rapid_thresholds_path is not None:
+        rapid_thresholds_path = rapid_thresholds_path.resolve()
+        # Parse before model load so malformed threshold bytes fail closed.
+        from openpi_client import rapid_trigger
+
+        rapid_trigger.load_threshold_document(rapid_thresholds_path)
+        rapid_thresholds_receipt = {
+            "path": str(rapid_thresholds_path),
+            "sha256": task_c_trace.sha256_file(rapid_thresholds_path),
+        }
+        if require_threshold_seal:
+            if threshold_sums_path is None:
+                raise task_c_trace.TaskCTraceError("sealed eval requires threshold_sums_path")
+            threshold_seal_receipt = task_c_rapid.verify_threshold_sha_manifest(
+                repo,
+                rapid_thresholds_path,
+                threshold_sums_path.resolve(),
+            )
+    elif require_threshold_seal:
+        raise task_c_trace.TaskCTraceError("sealed eval requires rapid_thresholds_path")
     output = output.resolve()
     if output.exists() and any(output.iterdir()):
         raise task_c_trace.TaskCTraceError(f"refusing to overwrite non-empty condition output: {output}")
     output.mkdir(parents=True, exist_ok=True)
     (output / "server_trace").mkdir()
     (output / "videos").mkdir()
-    experiment = "C1_libero_spatial_k9" if suite == "libero_spatial" else f"C3_{suite}_k9"
-    run_id = f"{experiment.lower()}-{condition}-seed{seed}-tasks{task_id_start}-{task_id_start + task_id_count - 1}"
+    experiment = experiment_override or (
+        "C1_libero_spatial_k9" if suite == "libero_spatial" else f"C3_{suite}_k9"
+    )
+    run_id = (
+        f"{experiment.lower()}-{condition}-seed{seed}-tasks{task_id_start}-{task_id_start + task_id_count - 1}"
+        f"-init{episode_idx_start}-{episode_idx_start + trials_per_task - 1}"
+    )
     port = _find_port()
     provenance = output / "provenance"
     checkpoint_verification = verify_checkpoint_manifest(checkpoint.parent, checkpoint_manifest_path)
@@ -405,19 +492,36 @@ def run_condition(
         "started_at": _now(),
         "run_id": run_id,
         "condition": condition,
-        "kappa_delta": CONDITIONS[condition],
+        "routing_policy": routing_policy,
+        "kappa_delta": kappa_delta,
         "experiment": experiment,
+        "calibration_stage": calibration_stage,
+        "excluded_from_calibration_and_eval": calibration_stage == "smoke",
         "suite": suite,
         "seed": seed,
         "task_id_start": task_id_start,
         "task_id_count": task_id_count,
         "trials_per_task": trials_per_task,
+        "episode_idx_start": episode_idx_start,
+        "episode_idx_stop_exclusive": episode_idx_start + trials_per_task,
         "expected_episodes": task_id_count * trials_per_task,
         "action_horizon": 10,
         "trigger_k": 9,
         "overlap": 1,
         "wm_delta_t": 1.0,
-        "confidence_schedule": condition != "faac_only",
+        "confidence_schedule": condition != "faac_only" or rapid_spec is not None,
+        "wm_still_required_for_faac": True,
+        "only_manipulated_variable": "routing_policy" if rapid_spec is not None else None,
+        "shared_execution_path": task_c_rapid.shared_execution_path(repo) if rapid_spec is not None else None,
+        "rapid_thresholds": rapid_thresholds_receipt,
+        "rapid_thresholds_sha256": (
+            rapid_thresholds_receipt["sha256"] if rapid_thresholds_receipt is not None else None
+        ),
+        "rapid_threshold_seal": threshold_seal_receipt,
+        "rapid_calib_gates": gate_receipt,
+        "baseline_reconciliation": (
+            gate_config.get("baseline_reconciliation") if gate_config is not None else None
+        ),
         "checkpoint": {
             "model_id": MODEL_ID,
             "resolved_revision": MODEL_REVISION,
@@ -455,7 +559,7 @@ def run_condition(
             "rule": "approach before first of two consecutive gripper commands > 0; contact from that command onward",
             "ee_velocity_proxy": "L2 and vector delta of end-effector xyz per simulator control step",
         },
-        "mu_split": "episode_idx even calibration; odd eval; split excludes condition and outcome",
+        "mu_split": "episode_idx parity storage split only; RAPID Cal-Fit/Cal-Confirm/final partitions are manifest-sealed disjoint ranges",
         "denoise_pairing_caveat": "not applicable: this JAX evaluation uses the released policy RNG stream per condition",
     }
     task_c_trace.write_json_atomic(output / "run_manifest.json", manifest)
@@ -506,6 +610,8 @@ def run_condition(
         suite,
         "--num-trials-per-task",
         str(trials_per_task),
+        "--episode-idx-start",
+        str(episode_idx_start),
         "--task-id-start",
         str(task_id_start),
         "--task-id-count",
@@ -532,8 +638,23 @@ def run_condition(
         "--task-c-condition",
         condition,
     ]
-    kappa_delta = CONDITIONS[condition]
-    if kappa_delta is not None:
+    if rapid_spec is not None:
+        client_command.extend(
+            [
+                "--async-wm-multi-rollout",
+                "--async-wm-multi-rollout-adaptive-kappa",
+                "--async-wm-multi-rollout-adaptive-kappa-low-replan",
+                "--async-wm-routing-policy",
+                routing_policy,
+                "--async-wm-rollout-delta-t",
+                "1.0",
+                "--async-wm-multi-rollout-kappa-delta",
+                str(kappa_delta),
+            ]
+        )
+        if rapid_thresholds_path is not None:
+            client_command.extend(["--rapid-thresholds", str(rapid_thresholds_path)])
+    elif kappa_delta is not None:
         client_command.extend(
             [
                 "--async-wm-multi-rollout",
@@ -632,13 +753,21 @@ def _parse_args() -> argparse.Namespace:
     preflight_parser = subparsers.add_parser("preflight")
     preflight_parser.add_argument("--out", type=pathlib.Path, default=root / "preflight")
     run_parser = subparsers.add_parser("run-condition")
-    run_parser.add_argument("--condition", choices=sorted(CONDITIONS), required=True)
+    run_parser.add_argument("--condition", required=True)
     run_parser.add_argument("--suite", choices=SUITES, default="libero_spatial")
     run_parser.add_argument("--out", type=pathlib.Path, required=True)
     run_parser.add_argument("--trials-per-task", type=int, default=30)
     run_parser.add_argument("--task-id-start", type=int, default=0)
     run_parser.add_argument("--task-id-count", type=int, default=10)
     run_parser.add_argument("--seed", type=int, default=42)
+    run_parser.add_argument("--episode-idx-start", type=int, default=0)
+    run_parser.add_argument("--routing-policy", choices=("kappa", "always_infer", "rapid"), default="kappa")
+    run_parser.add_argument("--rapid-thresholds", type=pathlib.Path)
+    run_parser.add_argument("--experiment")
+    run_parser.add_argument("--calibration-stage")
+    run_parser.add_argument("--rapid-calib-gates", type=pathlib.Path)
+    run_parser.add_argument("--threshold-sums", type=pathlib.Path)
+    run_parser.add_argument("--require-threshold-seal", action="store_true")
     return parser.parse_args()
 
 
@@ -677,6 +806,14 @@ def main() -> None:
             task_id_count=args.task_id_count,
             seed=args.seed,
             cuda_device=args.cuda_device,
+            episode_idx_start=args.episode_idx_start,
+            routing_policy=args.routing_policy,
+            rapid_thresholds_path=args.rapid_thresholds,
+            experiment_override=args.experiment,
+            calibration_stage=args.calibration_stage,
+            gate_config_path=args.rapid_calib_gates,
+            threshold_sums_path=args.threshold_sums,
+            require_threshold_seal=args.require_threshold_seal,
         )
 
 

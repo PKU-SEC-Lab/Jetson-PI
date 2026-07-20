@@ -10,6 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from openpi_client import base_policy as _base_policy
+from openpi_client import rapid_trigger as _rapid_trigger
 from openpi_client import task_c_trace as _task_c_trace
 from typing_extensions import override
 
@@ -161,9 +162,14 @@ class Pi0AsyncInferencePolicy(_base_policy.BasePolicy):
         used_wm_multi = isinstance(meta.get("wm_multi_rollout"), dict) and bool(meta["wm_multi_rollout"].get("enabled"))
         policy_call_id = None
         if self._task_c_trace is not None:
+            routing_policy = None
+            if used_wm_multi:
+                routing_policy = meta["wm_multi_rollout"].get("routing_policy", "kappa")
             policy_call_id = self._task_c_trace.begin_policy_call(
                 trace_context,
-                kind="kappa_schedule" if used_wm_multi else "faac_refresh",
+                kind="rapid_schedule" if routing_policy in {"always_infer", "rapid"} else (
+                    "kappa_schedule" if used_wm_multi else "faac_refresh"
+                ),
             )
         wm_extras: dict[str, Any] = {}
         try:
@@ -314,6 +320,8 @@ class Pi0AsyncInferencePolicy(_base_policy.BasePolicy):
         decision: str,
         decision_eligible: bool,
         action_expert_executed: bool,
+        routing_policy: str | None = None,
+        rapid: dict[str, Any] | None = None,
     ) -> None:
         if self._task_c_trace is None:
             return
@@ -331,6 +339,8 @@ class Pi0AsyncInferencePolicy(_base_policy.BasePolicy):
             decision=decision,
             decision_eligible=decision_eligible,
             action_expert_executed=action_expert_executed,
+            routing_policy=routing_policy,
+            rapid=rapid,
         )
 
     def _infer_with_world_model(
@@ -451,12 +461,23 @@ class Pi0AsyncInferencePolicy(_base_policy.BasePolicy):
         overlap = int(mr["overlap"])
         adaptive = bool(mr.get("adaptive_kappa"))
         low_replan = bool(mr.get("adaptive_kappa_low_replan"))
+        routing_policy = str(mr.get("routing_policy", "kappa"))
+        if routing_policy not in {"kappa", "always_infer", "rapid"}:
+            raise ValueError(f"unknown wm_multi_rollout.routing_policy: {routing_policy!r}")
+        rapid_payload = mr.get("rapid")
+        if rapid_payload is not None and not isinstance(rapid_payload, dict):
+            raise ValueError("wm_multi_rollout.rapid must be a mapping or null")
+        rapid_route = None if rapid_payload is None else rapid_payload.get("decision")
+        if routing_policy == "rapid" and rapid_route not in {"skip", "infer"}:
+            raise ValueError("RAPID routing requires rapid.decision=skip or infer")
+        if routing_policy != "kappa" and not low_replan:
+            raise ValueError("non-kappa routing requires the shared low-replan fallback path")
         kappa_th = float(mr.get("kappa_delta", 0.2))
         if num_rounds < 1:
             raise ValueError("wm_multi_rollout.num_rounds must be >= 1")
         if overlap < 1:
             raise ValueError("wm_multi_rollout.overlap must be >= 1 for non-empty first WM prefix")
-        delta_idx = int(round(delta_t_wm))
+        delta_idx = round(delta_t_wm)
         if delta_idx < 1:
             raise ValueError("wm_multi_rollout.delta_t must round to a positive integer index step")
 
@@ -603,7 +624,14 @@ class Pi0AsyncInferencePolicy(_base_policy.BasePolicy):
                     kappa0_f = k_f
                 elif kappa0_f is not None:
                     if low_replan:
-                        if k_f < kappa0_f - kappa_th:
+                        route = _rapid_trigger.route_decision(
+                            routing_policy,  # type: ignore[arg-type]
+                            rapid_route=rapid_route,  # type: ignore[arg-type]
+                            kappa=k_f,
+                            kappa0=kappa0_f,
+                            delta=kappa_th,
+                        )
+                        if route == "infer":
                             self._complete_task_c_wm_measurement(measurement, mu)
                             self._record_task_c_wm(
                                 measurement,
@@ -613,6 +641,8 @@ class Pi0AsyncInferencePolicy(_base_policy.BasePolicy):
                                 decision="infer_vlm",
                                 decision_eligible=True,
                                 action_expert_executed=False,
+                                routing_policy=routing_policy,
+                                rapid=rapid_payload,
                             )
                             kappa_np = np.asarray(
                                 jax.device_get(jnp.stack(kappa_per_round, axis=0)), dtype=np.float32
@@ -685,9 +715,11 @@ class Pi0AsyncInferencePolicy(_base_policy.BasePolicy):
                 decision=decision,
                 decision_eligible=r > 0,
                 action_expert_executed=True,
+                routing_policy=routing_policy,
+                rapid=rapid_payload,
             )
 
-        extras: dict[str, Any] = {"wm_stitch_n": int(len(kappa_per_round))}
+        extras: dict[str, Any] = {"wm_stitch_n": len(kappa_per_round)}
         if adaptive:
             extras["adaptive_max_rounds"] = max_r
             extras["adaptive_early_stop"] = early_exec_len is not None

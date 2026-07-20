@@ -14,6 +14,7 @@ from libero.libero.envs import OffScreenRenderEnv
 import numpy as np
 from openpi_client import action_chunk_broker
 from openpi_client import image_tools
+from openpi_client import rapid_trigger
 from openpi_client import task_c_trace
 from openpi_client import websocket_client_policy as _websocket_client_policy
 import tqdm
@@ -267,7 +268,7 @@ def _libero_wm_multi_rollout_prefetch_hook(
         out = dict(obs)
         H = int(ctx.action_horizon)  # noqa: N806 - published horizon notation
         O = int(ctx.overlap_skip)  # noqa: E741,N806 - published overlap notation
-        delta_idx = int(round(float(wm_rollout_delta_t)))
+        delta_idx = round(float(wm_rollout_delta_t))
         if O + (num_rounds - 1) * delta_idx > H:
             raise ValueError(
                 "wm_multi_rollout prefetch: need overlap_skip + (num_rounds-1)*round(wm_rollout_delta_t) <= "
@@ -317,6 +318,8 @@ def _libero_wm_multi_rollout_adaptive_prefetch_hook(
     kappa_delta: float,
     ae_proprio_source: str | None = None,
     adaptive_kappa_low_replan: bool = False,
+    routing_policy: rapid_trigger.RoutingPolicy = "kappa",
+    rapid_observer: rapid_trigger.RapidKinematicTrigger | None = None,
 ):
     def hook(obs: dict, ctx: action_chunk_broker.PrefetchContext) -> dict:
         from openpi.policies.wm_multi_rollout_schedule import wm_multi_rollout_adaptive_max_rounds
@@ -324,7 +327,7 @@ def _libero_wm_multi_rollout_adaptive_prefetch_hook(
         out = dict(obs)
         H = int(ctx.action_horizon)  # noqa: N806 - published horizon notation
         O = int(ctx.overlap_skip)  # noqa: E741,N806 - published overlap notation
-        delta_idx = int(round(float(wm_rollout_delta_t)))
+        delta_idx = round(float(wm_rollout_delta_t))
         max_r = wm_multi_rollout_adaptive_max_rounds(h=H, overlap=O, delta_idx=delta_idx)
         if O + (max_r - 1) * delta_idx > H:
             raise ValueError(
@@ -349,12 +352,23 @@ def _libero_wm_multi_rollout_adaptive_prefetch_hook(
             default_n=int(max_r),
             overlap_exec_band=ctx.wm_overlap_exec_band,
         )
+        rapid_payload = None
+        if rapid_observer is not None:
+            latest = rapid_observer.latest_decision
+            if latest is None:
+                raise RuntimeError("RAPID observer has no real-proprio sample at prefetch")
+            latest = rapid_trigger.apply_gripper_command_veto(latest, seed[:, 6])
+            rapid_payload = latest.as_dict()
+        if routing_policy == "rapid" and rapid_payload is None:
+            raise RuntimeError("RAPID routing requires a configured kinematic observer")
         out[async_key] = {
             "use_world_model": True,
             "wm_multi_rollout": {
                 "enabled": True,
                 "adaptive_kappa": True,
                 "adaptive_kappa_low_replan": bool(adaptive_kappa_low_replan),
+                "routing_policy": routing_policy,
+                "rapid": rapid_payload,
                 "kappa_delta": float(kappa_delta),
                 "num_rounds": int(max_r),
                 "delta_t": float(wm_rollout_delta_t),
@@ -523,11 +537,13 @@ class Args:
     async_wm_multi_rollout_num_rounds: int = 3
     async_wm_multi_rollout_adaptive_kappa: bool = False
     async_wm_multi_rollout_adaptive_kappa_low_replan: bool = False
+    async_wm_routing_policy: Literal["kappa", "always_infer", "rapid"] = "kappa"
     async_wm_multi_rollout_kappa_delta: float = 0.2
     async_wm_rollout_delta_t: float = 2.0
     task_suite_name: str = "libero_spatial"
     num_steps_wait: int = 10
     num_trials_per_task: int = 50
+    episode_idx_start: int = 0
     video_out_path: str = "data/libero/videos"
     wm_confidence_jsonl: str | None = None
     seed: int = 7
@@ -537,6 +553,7 @@ class Args:
     task_c_trace_dir: str | None = None
     task_c_run_id: str | None = None
     task_c_condition: str | None = None
+    rapid_thresholds: str | None = None
 
 
 def eval_libero(args: Args) -> None:
@@ -566,10 +583,17 @@ def eval_libero(args: Args) -> None:
         raise ValueError(
             "async_wm_multi_rollout_adaptive_kappa_low_replan=True requires async_wm_multi_rollout_adaptive_kappa=True"
         )
+    if args.async_wm_routing_policy != "kappa":
+        if not args.async_wm_multi_rollout_adaptive_kappa_low_replan:
+            raise ValueError(
+                "async_wm_routing_policy other than kappa requires adaptive-kappa low-replan shared paths"
+            )
+        if args.async_wm_routing_policy == "rapid" and args.rapid_thresholds is None:
+            raise ValueError("async_wm_routing_policy=rapid requires rapid_thresholds")
     if args.async_wm_multi_rollout:
         if args.async_prefetch_proprio != "trigger":
             raise ValueError("async_wm_multi_rollout=True requires async_prefetch_proprio=trigger")
-        d_idx = int(round(float(args.async_wm_rollout_delta_t)))
+        d_idx = round(float(args.async_wm_rollout_delta_t))
         if args.overlap_skip < 1:
             raise ValueError("async_wm_multi_rollout=True requires overlap_skip>=1 (non-empty first WM prefix)")
         if d_idx < 1:
@@ -652,6 +676,22 @@ def eval_libero(args: Args) -> None:
         if args.task_id_count < 1:
             raise ValueError("task_id_count must be >= 1")
         task_id_stop = min(num_tasks_in_suite, args.task_id_start + args.task_id_count)
+    if args.episode_idx_start < 0:
+        raise ValueError("episode_idx_start must be non-negative")
+    required_init_states = args.episode_idx_start + args.num_trials_per_task
+    initial_states_by_task: dict[int, np.ndarray] = {}
+    initial_state_counts: dict[int, int] = {}
+    for check_task_id in range(args.task_id_start, task_id_stop):
+        states = task_suite.get_task_init_states(check_task_id)
+        initial_states_by_task[check_task_id] = states
+        initial_state_counts[check_task_id] = len(states)
+    too_short = {task_id: count for task_id, count in initial_state_counts.items() if count < required_init_states}
+    if too_short:
+        raise ValueError(
+            f"selected tasks need at least {required_init_states} init states for episode_idx_start="
+            f"{args.episode_idx_start}, got {too_short}"
+        )
+    logging.info("LIBERO init-state preflight counts: %s", initial_state_counts)
 
     pathlib.Path(args.video_out_path).mkdir(parents=True, exist_ok=True)
 
@@ -678,6 +718,21 @@ def eval_libero(args: Args) -> None:
         "task_c_latest_obs": None,
     }
     proprio_chunk_idx = None
+    rapid_observer: rapid_trigger.RapidKinematicTrigger | None = None
+    if args.rapid_thresholds is not None:
+        thresholds = rapid_trigger.load_threshold_document(pathlib.Path(args.rapid_thresholds))
+        rapid_observer = rapid_trigger.RapidKinematicTrigger(thresholds)
+
+    def record_and_observe_proprio(observation: dict) -> None:
+        state = observation["observation/state"]
+        if task_c_recorder is not None:
+            context = observation.get(task_c_trace.TRACE_KEY)
+            if context is None:
+                raise task_c_trace.TaskCTraceError("Task-C trigger observation is missing its trace context")
+            task_c_recorder.record_proprio_observation(context, state=state)
+        if rapid_observer is not None:
+            rapid_observer.observe(state)
+
     if args.async_inference:
         if args.async_use_proprio_state_at_h_minus_k:
             proprio_chunk_idx = args.action_horizon - args.async_trigger_step
@@ -708,6 +763,8 @@ def eval_libero(args: Args) -> None:
                 kappa_delta=args.async_wm_multi_rollout_kappa_delta,
                 ae_proprio_source=None,
                 adaptive_kappa_low_replan=args.async_wm_multi_rollout_adaptive_kappa_low_replan,
+                routing_policy=args.async_wm_routing_policy,
+                rapid_observer=rapid_observer,
             )
         elif args.async_use_world_model and args.async_wm_multi_rollout:
             prefetch_hook = _libero_wm_multi_rollout_prefetch_hook(
@@ -760,6 +817,9 @@ def eval_libero(args: Args) -> None:
                 observation_state_chunk_index=proprio_chunk_idx,
                 wm_infer_complete_hook=_wm_ae_infer_stats.on_infer_complete,
                 low_replan_two_phase_fn=low_replan_two_phase_fn,
+                observation_step_hook=(
+                    record_and_observe_proprio if task_c_recorder is not None or rapid_observer is not None else None
+                ),
             )
     else:
         chunk_policy = action_chunk_broker.ActionChunkBroker(policy=client, action_horizon=args.action_horizon)
@@ -772,7 +832,7 @@ def eval_libero(args: Args) -> None:
         per_task_mean_success: list[float] = []
         for task_id in tqdm.tqdm(range(args.task_id_start, task_id_stop)):
             task = task_suite.get_task(task_id)
-            initial_states = task_suite.get_task_init_states(task_id)
+            initial_states = initial_states_by_task[task_id]
             env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
             env_holder["env"] = env
             env_holder["task_description"] = str(task_description)
@@ -780,9 +840,12 @@ def eval_libero(args: Args) -> None:
             task_episodes, task_successes = 0, 0
             task_control_steps_all: list[int] = []
             task_control_steps_success: list[int] = []
-            for episode_idx in tqdm.tqdm(range(args.num_trials_per_task)):
+            episode_stop = args.episode_idx_start + args.num_trials_per_task
+            for episode_idx in tqdm.tqdm(range(args.episode_idx_start, episode_stop)):
                 logging.info("\nTask: %s", task_description)
                 chunk_policy.reset()
+                if rapid_observer is not None:
+                    rapid_observer.reset()
                 env.reset()
                 obs = env.set_init_state(initial_states[episode_idx])
                 env_holder["task_c_sim_step"] = 0

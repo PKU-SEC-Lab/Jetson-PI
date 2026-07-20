@@ -315,6 +315,7 @@ class AsyncActionBufferBroker(_base_policy.BasePolicy):
         observation_state_chunk_index: int | None = None,
         wm_infer_complete_hook: Callable[[Dict], None] | None = None,
         low_replan_two_phase_fn: Callable[[Dict, Dict], Dict] | None = None,
+        observation_step_hook: Callable[[Dict], None] | None = None,
     ) -> None:
         if chunk_exec_steps is not None:
             raise ValueError("AsyncActionBufferBroker does not support chunk_exec_steps; pass None.")
@@ -351,6 +352,7 @@ class AsyncActionBufferBroker(_base_policy.BasePolicy):
         self._observation_state_chunk_index = observation_state_chunk_index
         self._wm_infer_complete_hook = wm_infer_complete_hook
         self._low_replan_two_phase_fn = low_replan_two_phase_fn
+        self._observation_step_hook = observation_step_hook
 
         self._buf: deque[Dict] = deque()
         self._last_infer_full: np.ndarray | None = None
@@ -414,7 +416,7 @@ class AsyncActionBufferBroker(_base_policy.BasePolicy):
         acts = full.get("actions")
         if acts is not None:
             a = np.asarray(acts, dtype=np.float32)
-            H, O = self._action_horizon, self._overlap_skip
+            H, O = self._action_horizon, self._overlap_skip  # noqa: E741,N806 - published horizon notation
             self._last_infer_full = np.array(a, dtype=np.float32, copy=True)
             self._last_wm_stitch_n = wm_stitch_n_from_policy_full(full)
             self._last_wm_overlap_exec_band = np.array(a[H - O : H], dtype=np.float32, copy=True)
@@ -426,7 +428,7 @@ class AsyncActionBufferBroker(_base_policy.BasePolicy):
         acts = full.get("actions")
         if acts is not None:
             a = np.asarray(acts, dtype=np.float32)
-            H, O = self._action_horizon, self._overlap_skip
+            H, O = self._action_horizon, self._overlap_skip  # noqa: E741,N806 - published horizon notation
             self._last_infer_full = np.array(a, dtype=np.float32, copy=True)
             self._last_wm_stitch_n = wm_stitch_n_from_policy_full(full)
             self._last_wm_overlap_exec_band = np.array(a[H - O : H], dtype=np.float32, copy=True)
@@ -472,7 +474,7 @@ class AsyncActionBufferBroker(_base_policy.BasePolicy):
         acts = full.get("actions")
         if acts is not None:
             a = np.asarray(acts, dtype=np.float32)
-            H, O = self._action_horizon, self._overlap_skip
+            H, O = self._action_horizon, self._overlap_skip  # noqa: E741,N806 - published horizon notation
             self._last_infer_full = np.array(a, dtype=np.float32, copy=True)
             self._last_wm_stitch_n = wm_stitch_n_from_policy_full(full)
             self._last_wm_overlap_exec_band = np.array(a[H - O : H], dtype=np.float32, copy=True)
@@ -516,6 +518,8 @@ class AsyncActionBufferBroker(_base_policy.BasePolicy):
 
     @override
     def infer(self, obs: Dict) -> Dict:  # noqa: UP006
+        if self._observation_step_hook is not None:
+            self._observation_step_hook(obs)
         if self._wm_adapt_prefetch_on_next:
             self._start_prefetch(obs)
             self._wm_adapt_prefetch_on_next = False

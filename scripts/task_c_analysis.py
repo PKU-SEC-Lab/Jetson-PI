@@ -245,6 +245,8 @@ def _phase_counts(
 
 
 def finalize_condition(output_root: pathlib.Path) -> dict[str, Any]:
+    from scripts import task_c_rapid
+
     output_root = output_root.resolve()
     manifest_path = output_root / "run_manifest.json"
     if not manifest_path.is_file():
@@ -257,6 +259,8 @@ def finalize_condition(output_root: pathlib.Path) -> dict[str, Any]:
     steps = task_c_trace.read_jsonl(output_root / "steps_raw.jsonl")
     wm_calls = task_c_trace.read_jsonl(output_root / "server_trace" / "wm_calls.jsonl")
     policy_calls = task_c_trace.read_jsonl(output_root / "server_trace" / "policy_calls.jsonl")
+    proprio_path = output_root / "proprio_observations.jsonl"
+    proprio_observations = task_c_trace.read_jsonl(proprio_path) if proprio_path.is_file() else []
     if len(episodes) != expected_episodes:
         raise task_c_trace.TaskCTraceError(f"episode count {len(episodes)} != expected {expected_episodes}")
     episode_by_trajectory = _unique_by(episodes, "trajectory_id")
@@ -307,6 +311,8 @@ def finalize_condition(output_root: pathlib.Path) -> dict[str, Any]:
                         "decision": call["decision"],
                         "decision_eligible": call["decision_eligible"],
                         "c_tier0_ms": call["c_tier0_ms"],
+                        "routing_policy": call.get("routing_policy"),
+                        "rapid": call.get("rapid"),
                     }
                     for call in linked
                 ],
@@ -320,6 +326,12 @@ def finalize_condition(output_root: pathlib.Path) -> dict[str, Any]:
         raise task_c_trace.TaskCTraceError("no measured C_tier0 calls remain after warmup exclusion")
     eligible = [call for call in wm_calls if call["decision_eligible"]]
     skips, reinfers = _count_kappa_decisions(eligible)
+    rapid_calls = task_c_rapid._rapid_policy_rows(  # noqa: SLF001 - shared raw-row experiment seam
+        wm_calls,
+        kappa_delta=float(manifest.get("kappa_delta") or task_c_rapid.DEFAULT_KAPPA_DELTA),
+    )
+    if rapid_calls:
+        _write_jsonl(output_root / "rapid_calls.jsonl", rapid_calls)
     rounds_by_policy: dict[str, int] = defaultdict(int)
     for call in wm_calls:
         rounds_by_policy[str(call["policy_call_id"])] += 1
@@ -337,6 +349,7 @@ def finalize_condition(output_root: pathlib.Path) -> dict[str, Any]:
         "episodes": len(episodes),
         "successes": sum(bool(item["success"]) for item in episodes),
         "success_rate": sum(bool(item["success"]) for item in episodes) / len(episodes),
+        "wm_still_required_for_faac": bool(manifest.get("wm_still_required_for_faac", True)),
         "per_task": task_summary,
         "policy_calls": {
             "total_vlm_calls": len(policy_calls),
@@ -356,6 +369,33 @@ def finalize_condition(output_root: pathlib.Path) -> dict[str, Any]:
         },
         "c_tier0_ms": task_c_trace.percentile_summary(measured_timing),
         "c_tier0_warmup_calls_discarded": sum(bool(call["timing_warmup"]) for call in wm_calls),
+        "rapid": (
+            {
+                "policy_call_decisions": len(rapid_calls),
+                "shadow_skip_decisions": sum(call["rapid_decision"] == "skip" for call in rapid_calls),
+                "raw_skip_rate": task_c_trace.ratio(
+                    sum(call["rapid_decision"] == "skip" for call in rapid_calls), len(rapid_calls)
+                ),
+                "executed_skip_decisions": sum(call["executed_decision"] == "skip" for call in rapid_calls),
+                "trigger_compute_us": task_c_trace.percentile_summary(
+                    [float(call["trigger_compute_ns"]) / 1000.0 for call in rapid_calls]
+                ),
+                "kappa_decision_agreement": {
+                    "agreements": sum(bool(call["decision_agreement"]) for call in rapid_calls),
+                    "disagreements": sum(not bool(call["decision_agreement"]) for call in rapid_calls),
+                    "agreement_rate": task_c_trace.ratio(
+                        sum(bool(call["decision_agreement"]) for call in rapid_calls), len(rapid_calls)
+                    ),
+                },
+                "raw_rows": "rapid_calls.jsonl",
+            }
+            if rapid_calls
+            else None
+        ),
+        "rapid_proprio_observations": {
+            "rows": len(proprio_observations),
+            "sha256": task_c_trace.sha256_file(proprio_path) if proprio_observations else None,
+        },
         "mu": mu_receipt,
     }
     task_c_trace.write_json_atomic(output_root / "summary.json", summary)

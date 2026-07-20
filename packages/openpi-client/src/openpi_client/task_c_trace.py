@@ -248,7 +248,7 @@ class ServerTraceRecorder:
             expected_condition=self.condition,
             expected_run_id=self.run_id,
         )
-        if kind not in {"plain_vlm", "faac_refresh", "kappa_schedule"}:
+        if kind not in {"plain_vlm", "faac_refresh", "kappa_schedule", "rapid_schedule"}:
             raise TaskCTraceError(f"unsupported Task-C policy-call kind: {kind!r}")
         with self._lock:
             idx = self._policy_call_index
@@ -281,6 +281,8 @@ class ServerTraceRecorder:
         decision: str,
         decision_eligible: bool,
         action_expert_executed: bool,
+        routing_policy: str | None = None,
+        rapid: Mapping[str, Any] | None = None,
     ) -> str:
         ctx = validate_trace_context(
             context,
@@ -303,6 +305,19 @@ class ServerTraceRecorder:
             raise TaskCTraceError("kappa_host_check_ms must be finite and >= 0")
         if not math.isfinite(float(kappa_decision_ms)) or kappa_decision_ms < 0:
             raise TaskCTraceError("kappa_decision_ms must be finite and >= 0")
+        rapid_fields: dict[str, Any] = {}
+        if routing_policy is not None:
+            if routing_policy not in {"kappa", "always_infer", "rapid"}:
+                raise TaskCTraceError(f"unsupported Task-C routing_policy: {routing_policy!r}")
+            rapid_fields["routing_policy"] = routing_policy
+        if rapid is not None:
+            rapid_record = dict(rapid)
+            if rapid_record.get("decision") not in {"skip", "infer"}:
+                raise TaskCTraceError("RAPID trace decision must be skip or infer")
+            compute_ns = rapid_record.get("trigger_compute_ns")
+            if isinstance(compute_ns, bool) or not isinstance(compute_ns, int) or compute_ns < 0:
+                raise TaskCTraceError("RAPID trigger_compute_ns must be a non-negative integer")
+            rapid_fields["rapid"] = rapid_record
 
         mu_array = np.asarray(mu)
         if mu_array.shape == (1, *MU_SHAPE):
@@ -357,6 +372,7 @@ class ServerTraceRecorder:
                     "timing_warmup": wm_idx < self.timing_warmup_calls,
                     "mu_sha256": mu_sha,
                     "mu_raw_row": row,
+                    **rapid_fields,
                     **ctx,
                 },
             )
@@ -371,10 +387,36 @@ class ClientTraceRecorder:
         self.run_id = str(run_id)
         self.condition = str(condition)
         self.root.mkdir(parents=True, exist_ok=True)
-        guarded = [self.root / "episodes.jsonl", self.root / "steps_raw.jsonl"]
+        guarded = [
+            self.root / "episodes.jsonl",
+            self.root / "steps_raw.jsonl",
+            self.root / "proprio_observations.jsonl",
+        ]
         dirty = [str(path) for path in guarded if path.exists() and path.stat().st_size]
         if dirty:
             raise TaskCTraceError(f"refusing to append to non-empty Task-C client trace: {dirty}")
+
+    def record_proprio_observation(self, context: Mapping[str, Any], *, state: np.ndarray) -> None:
+        """Record the exact raw proprio row consumed by an O(1) client trigger."""
+
+        ctx = validate_trace_context(
+            context,
+            expected_condition=self.condition,
+            expected_run_id=self.run_id,
+        )
+        state_array = np.asarray(state, dtype=np.float32).reshape(-1)
+        if state_array.shape != (8,):
+            raise TaskCTraceError(f"LIBERO trigger proprio shape mismatch: {state_array.shape} != (8,)")
+        if not np.isfinite(state_array).all():
+            raise TaskCTraceError("non-finite LIBERO trigger proprio")
+        append_jsonl(
+            self.root / "proprio_observations.jsonl",
+            {
+                "schema_version": SCHEMA_VERSION,
+                "state": [float(value) for value in state_array],
+                **ctx,
+            },
+        )
 
     def record_step(
         self,
@@ -503,7 +545,7 @@ def paired_bootstrap_success_delta(
     *,
     seed: int = 20260719,
     samples: int = 50_000,
-) -> dict[str, float | int]:
+) -> dict[str, float | int | str]:
     """Deterministic paired-bootstrap interval for candidate minus baseline SR."""
 
     if len(baseline) != len(candidate) or not baseline:
@@ -524,6 +566,7 @@ def paired_bootstrap_success_delta(
         remaining -= chunk
     boot = np.concatenate(means)
     return {
+        "method": "paired_percentile",
         "n_pairs": int(diffs.size),
         "samples": int(samples),
         "seed": int(seed),
