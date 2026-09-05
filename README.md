@@ -33,7 +33,7 @@
 
 ## News
 
-- **[2026/09] Jetson-PI has been accepted at CoRL 2026!**
+- **[2026/09] 🎉🎉🎉 Jetson-PI has been accepted at CoRL 2026!**
 
 ## Overview
 
@@ -332,12 +332,11 @@ See `LICENSE` and `LICENSE_GEMMA.txt`. LIBERO and upstream openpi components ret
 If Jetson-PI helps your research, please cite our paper:
 
 ```bibtex
-@inproceedings{yang2026jetson,
+@article{yang2026jetson,
   title={Jetson-PI: Towards Onboard Real-Time Robot Control via Foresight-Aligned Asynchronous Inference},
   author={Yang, Zebin and Wang, Qi and Wang, Yunhe and Guo, Xiurui and Yu, Bo and Liu, Shaoshan and Xu, Jiafeng and Dong, Hao and Li, Meng},
-  booktitle={Conference on Robot Learning (CoRL)},
-  year={2026},
-  url={https://arxiv.org/abs/2607.12659}
+  journal={arXiv preprint arXiv:2607.12659},
+  year={2026}
 }
 ```
 
