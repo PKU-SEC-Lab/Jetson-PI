@@ -31,10 +31,6 @@
 
 ---
 
-## News
-
-- **[2026/09] 🎉🎉🎉 Jetson-PI has been accepted at CoRL 2026!**
-
 ## Overview
 
 This repository is the official implementation of:
