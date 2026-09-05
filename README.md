@@ -11,6 +11,7 @@
 
   <p>
     <a href="https://arxiv.org/abs/2607.12659"><img src="https://img.shields.io/badge/arXiv-2607.12659-b31b1b.svg" alt="arXiv" /></a>
+    <a href="https://www.corl.org/"><img src="https://img.shields.io/badge/CoRL-2026_Accepted-6f42c1.svg" alt="Accepted at CoRL 2026" /></a>
     <a href="https://github.com/PKU-SEC-Lab/Jetson-PI"><img src="https://img.shields.io/badge/Code-Jetson--PI-35b8a9.svg" alt="Jetson-PI code" /></a>
     <a href="https://www.modelscope.cn/models/zebinyang/Jetson-PI-pi05"><img src="https://img.shields.io/badge/Model-Jetson--PI--pi05-624AFF.svg" alt="Jetson-PI pi05 model" /></a>
     <a href="https://github.com/PKU-SEC-Lab/Jetson-PI-Edge"><img src="https://img.shields.io/badge/Runtime-Jetson--PI--Edge-3578c8.svg" alt="Jetson-PI-Edge runtime" /></a>
@@ -30,13 +31,17 @@
 
 ---
 
+## News
+
+- **[2026/09] Jetson-PI has been accepted at CoRL 2026!**
+
 ## Overview
 
 This repository is the official implementation of:
 
 > **[Jetson-PI: Towards Onboard Real-Time Robot Control via Foresight-Aligned Asynchronous Inference](https://arxiv.org/abs/2607.12659)**<br>
 > Zebin Yang, Qi Wang, Yunhe Wang, Xiurui Guo, Bo Yu, Shaoshan Liu, Jiafeng Xu, Hao Dong, and Meng Li.<br>
-> arXiv:2607.12659, 2026.
+> Accepted at the Conference on Robot Learning (CoRL), 2026.
 
 Vision-Language-Action (VLA) models have achieved impressive performance on diverse embodied tasks, yet deploying them on low-power onboard devices such as NVIDIA Jetson Orin remains challenging due to high inference latency and limited compute. Asynchronous inference can partially mask this latency, but it introduces **prediction–execution misalignment** and **long reaction time**. Jetson-PI addresses both through **Foresight-Aligned Asynchronous Correction (FAAC)**: we train a lightweight **future correction module** that predicts **future environment representation** conditioned on committed actions, enabling the **action expert** to directly predict actions from the future time step; we further introduce **confidence-based scheduling optimization** that adaptively balances VLM and action expert invocations.
 
@@ -327,11 +332,12 @@ See `LICENSE` and `LICENSE_GEMMA.txt`. LIBERO and upstream openpi components ret
 If Jetson-PI helps your research, please cite our paper:
 
 ```bibtex
-@article{yang2026jetson,
+@inproceedings{yang2026jetson,
   title={Jetson-PI: Towards Onboard Real-Time Robot Control via Foresight-Aligned Asynchronous Inference},
   author={Yang, Zebin and Wang, Qi and Wang, Yunhe and Guo, Xiurui and Yu, Bo and Liu, Shaoshan and Xu, Jiafeng and Dong, Hao and Li, Meng},
-  journal={arXiv preprint arXiv:2607.12659},
-  year={2026}
+  booktitle={Conference on Robot Learning (CoRL)},
+  year={2026},
+  url={https://arxiv.org/abs/2607.12659}
 }
 ```
 
